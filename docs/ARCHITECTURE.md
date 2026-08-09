@@ -16,8 +16,9 @@ CLI
  |      |
  |      +-- collect_macos.py
  |            +-- system_profiler SPNVMeDataType -json
- |            +-- smartctl --scan[-open]
- |            +-- smartctl -a -j
+ |            +-- diskutil physical-disk inventory
+ |            +-- smartctl --scan[-open] / smartctl -a -j
+ |            +-- macos_usb_nvme.py (RTL9210 direct USB path)
  |            +-- target-scoped unified-log evidence where possible
  |
  +-- diagnose.py -------------- shared evidence/correlation rules
@@ -25,9 +26,9 @@ CLI
  +-- render.py ---------------- text / JSON + capability disclosure
 ```
 
-## Source layout
+## Source and distribution layout
 
-The repository intentionally keeps the implementation flat under `src/`:
+The maintainable implementation remains flat under `src/`:
 
 ```text
 src/
@@ -37,6 +38,7 @@ src/
 ├── collect_macos.py
 ├── diagnose.py
 ├── diff.py
+├── macos_usb_nvme.py
 ├── model.py
 ├── platforms.py
 ├── render.py
@@ -44,7 +46,9 @@ src/
 └── util.py
 ```
 
-The repository launcher executes `src.cli` directly from the checkout. Packaging and the optional system-wide installer map these same files to the public installed Python package `nvme_doctor`; no `src/nvme_doctor/` directory is required in the repository.
+`tools/build_single.py` packages these modules into the root-level standalone `nvme-doctor` executable using a small in-memory importer. Relative imports and dynamic platform-specific imports continue to use the public `nvme_doctor` package name inside the bundled file.
+
+`install.sh` rebuilds this standalone file into a temporary location and installs only that executable. The installed command therefore does not depend on a companion Python package directory.
 
 ## Platform contract
 
@@ -56,11 +60,14 @@ For example, macOS currently marks PCIe AER and detailed PCIe topology unavailab
 
 Primary sources:
 
-- `/sys/class/nvme` for controller identity/state;
-- `/sys/bus/pci/devices` for BDF, PCIe link state, NUMA locality and AER counters;
-- `nvme-cli` for SMART, Identify Controller and error-log data;
-- `smartctl` as supplemental/fallback health evidence;
-- current-boot kernel logs restricted to the target controller and its PCIe ancestry.
+- `/sys/class/nvme` for native controller identity/state;
+- `/sys/bus/pci/devices` for native-NVMe BDF, PCIe link state, NUMA locality and AER counters;
+- `nvme-cli` for native NVMe SMART, Identify Controller and error-log data;
+- `smartctl --scan[-open]` plus USB solid-state sysfs candidates to discover NVMe devices translated to `/dev/sdX`;
+- `smartctl -a -j /dev/sdX` as the primary health source for confirmed USB/SCSI-translated NVMe and as supplemental/fallback evidence for native NVMe;
+- current-boot kernel logs restricted to the target controller/block-device name and, for native NVMe, its PCIe ancestry.
+
+For a translated `/dev/sdX` device, the backend deliberately marks native PCIe link/AER/NUMA facilities unavailable: the bridge can pass NVMe admin/SMART commands while still hiding the SSD's PCIe endpoint from Linux.
 
 ## macOS collection
 
@@ -73,7 +80,7 @@ Primary sources:
 
 macOS `SMART Status: Verified` is stored as contextual evidence but does not satisfy the requirement for full NVMe SMART/Health data.
 
-USB-NVMe bridge types returned by smartctl (for example `sntrealtek`) are retained and supplied back via `smartctl -d TYPE` for the selected disk.
+If smartctl itself reports a usable NVMe path/type on macOS, that exact reported path is retained. Current Darwin builds do not implement the SCSI backend required to force `sntrealtek`/`sntjmicron`/`sntasmedia` against ordinary `/dev/diskN` devices, so NVMe Doctor does not invent or force those modes.
 
 ## Diagnosis layer
 
@@ -90,7 +97,7 @@ The rule engine distinguishes direct evidence from correlation. Platform-specifi
 
 ## Safety model
 
-Collectors and rules are read-only. Remediation text may suggest a reversible A/B test, but the program does not perform controller resets, power-policy changes, firmware updates, namespace operations or destructive commands.
+NVMe commands used for health collection are read-only. Remediation text may suggest a reversible A/B test, but the program does not perform controller resets, power-policy changes, firmware updates, namespace operations or destructive commands. On macOS RTL9210 direct access temporarily unmounts and captures the USB device, then restores and remounts it.
 
 ## JSON schema
 

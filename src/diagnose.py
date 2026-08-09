@@ -111,7 +111,7 @@ def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) 
         headline = "There is not enough health evidence to issue a clean verdict."
     else:
         verdict = "HEALTHY NOW"
-        headline = "No active NVMe media, PCIe-link, thermal, or controller fault was detected."
+        headline = "No active fault was detected in the available NVMe health evidence."
 
     # Media / integrity
     media_sev = _finding_severity(findings, {"nvme-critical-warning", "available-spare", "media-errors"})
@@ -195,7 +195,16 @@ def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) 
         else:
             recommendation = "No immediate action is indicated. Save a JSON report as a baseline and compare again if symptoms appear."
     elif status == "INCOMPLETE":
-        recommendation = "Restore the missing primary health evidence (typically run as root and ensure nvme-cli or smartctl can read the controller) before trusting a clean result."
+        if snapshot.controller_info.get("nvme_passthrough") is False:
+            if snapshot.controller_info.get("passthrough_reason") == "darwin-no-scsi-passthrough":
+                if snapshot.controller_info.get("direct_usb"):
+                    recommendation = f"Direct RTL9210 access is available. Close applications using the disk, then run `sudo nvme-doctor check {snapshot.controller} --direct-usb`; NVMe Doctor will temporarily unmount/capture the enclosure, read Identify + SMART, release it, and remount it."
+                else:
+                    recommendation = "The SSD is present, but smartctl cannot use the SNT pass-through path on macOS. Use a native NVMe path, inspect it on Linux, or use a bridge supported by NVMe Doctor's direct USB backend."
+            else:
+                recommendation = "The SSD is present, but the USB bridge is hiding NVMe admin/SMART data. Use a passthrough-capable adapter or direct PCIe/M.2 connection for a full diagnosis."
+        else:
+            recommendation = "Restore the missing primary health evidence (typically run as root and ensure nvme-cli or smartctl can read the controller) before trusting a clean result."
     else:
         actionable = [f.actions[0] for f in findings if f.severity in {"critical", "warning"} and f.actions]
         recommendation = actionable[0] if actionable else "Review the warning/critical findings below before stressing or modifying the drive."
@@ -210,7 +219,37 @@ def diagnose(snapshot: Snapshot) -> Report:
     kernel = _kernel_flags(snapshot.kernel_lines) if snapshot.capabilities.get("targeted_kernel_log", True) else _kernel_flags([])
 
     state = str(snapshot.controller_info.get("state", "")).strip().lower()
-    if state and state not in {"live", "new", "connecting", "present"}:
+    passthrough_unavailable = snapshot.controller_info.get("nvme_passthrough") is False
+    if passthrough_unavailable:
+        darwin_no_scsi = snapshot.controller_info.get("passthrough_reason") == "darwin-no-scsi-passthrough"
+        direct_ready = bool(snapshot.controller_info.get("direct_usb"))
+        findings.append(Finding(
+            "nvme-passthrough-unavailable",
+            "info",
+            ("NVMe SMART is available through explicit direct USB mode" if (darwin_no_scsi and direct_ready)
+             else "Underlying NVMe health is unavailable through this macOS USB path" if darwin_no_scsi
+             else "Underlying NVMe health is hidden by the USB bridge"),
+            ("The external SSD is visible through an RTL9210 bridge. smartctl cannot use its SNT path on macOS, but NVMe Doctor can read the underlying NVMe Identify/SMART data by temporarily capturing the USB device when --direct-usb is explicitly requested."
+             if (darwin_no_scsi and direct_ready)
+             else "The external physical SSD is visible to macOS, but current smartmontools Darwin builds do not implement the SCSI device pass-through required by sntrealtek/sntjmicron/sntasmedia USB-NVMe bridge backends." if darwin_no_scsi
+             else "The external physical SSD is visible to the OS, but NVMe admin/SMART passthrough could not be opened through the USB enclosure."),
+            "high",
+            [
+                f"transport={snapshot.controller_info.get('transport') or 'USB'}",
+                f"usb_bridge={snapshot.controller_info.get('usb_bridge') or 'unknown'}",
+            ],
+            ([
+                f"Re-run explicitly as `sudo nvme-doctor check {snapshot.controller} --direct-usb` to temporarily unmount/capture the RTL9210 and read NVMe Identify + SMART.",
+                "Direct USB mode is read-only at the NVMe command level, but it temporarily unmounts and reattaches the enclosure; close applications using the disk first.",
+            ] if (darwin_no_scsi and direct_ready) else [
+                "For full NVMe health/admin data on this device, use a native NVMe path visible to macOS or inspect it on Linux.",
+                "Do not interpret macOS diskutil 'SMART Status: Not Supported' as an SSD health failure; it describes unavailable SMART access through this transport.",
+            ] if darwin_no_scsi else [
+                "Try the enclosure's latest firmware and a direct host USB port/cable, then rerun the check.",
+                "For full NVMe health data, use an enclosure/adapter with working NVMe SMART passthrough or connect the SSD directly to PCIe/M.2.",
+            ]),
+        ))
+    elif state and state not in {"live", "new", "connecting", "present"}:
         severity = "critical" if state in {"missing", "dead", "deleting"} else "warning"
         findings.append(Finding(
             "controller-state",
@@ -220,6 +259,17 @@ def diagnose(snapshot: Snapshot) -> Report:
             "high",
             [f"sysfs controller state: {state}"],
             ["Inspect the OS storage/kernel logs for the first reset, timeout, PCIe, or hotplug event before attempting a reset."],
+        ))
+
+    if snapshot.controller_info.get("native_nvme") is False and snapshot.controller_info.get("nvme_passthrough") is True:
+        findings.append(Finding(
+            "usb-nvme-bridge",
+            "info",
+            "NVMe is accessed through a USB/SCSI bridge",
+            "NVMe SMART/admin passthrough is working through the bridge, but the SSD's native PCIe link, AER counters and NUMA locality are hidden from the host.",
+            "high",
+            [f"device={snapshot.device_path}", f"transport={snapshot.controller_info.get('transport') or 'USB/SCSI -> NVMe'}"],
+            ["Use the SMART/Health results normally; connect the SSD through native PCIe/M.2 only when PCIe-link/AER/NUMA diagnosis is required."],
         ))
 
     critical_warning = _smart_int(smart, "critical_warning", "critical_warning_raw")

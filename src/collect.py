@@ -32,7 +32,7 @@ def _os_release() -> Dict[str, str]:
     return data
 
 
-def discover_controllers_linux(sys_class_nvme: Path = SYS_CLASS_NVME) -> List[Dict[str, Any]]:
+def _discover_native_controllers_linux(sys_class_nvme: Path = SYS_CLASS_NVME) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     if not sys_class_nvme.exists():
         return result
@@ -46,10 +46,182 @@ def discover_controllers_linux(sys_class_nvme: Path = SYS_CLASS_NVME) -> List[Di
             "serial": read_text(path / "serial"),
             "firmware": read_text(path / "firmware_rev"),
             "state": read_text(path / "state"),
-            "transport": read_text(path / "transport"),
+            "transport": read_text(path / "transport") or "PCIe/NVMe",
             "address": read_text(path / "address"),
+            "native_nvme": True,
         }
         result.append(info)
+    return result
+
+
+def _smartctl_json_is_nvme(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    protocol = str(device.get("protocol") or "").strip().lower()
+    dev_type = str(device.get("type") or "").strip().lower()
+    return (
+        protocol == "nvme"
+        or "nvme" in dev_type
+        or payload.get("nvme_version") is not None
+        or isinstance(payload.get("nvme_smart_health_information_log"), dict)
+    )
+
+
+def _smartctl_identity(payload: Dict[str, Any]) -> Dict[str, Any]:
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    return {
+        "model": payload.get("model_name") or payload.get("model_number"),
+        "serial": payload.get("serial_number"),
+        "firmware": payload.get("firmware_version"),
+        "nvme_version": payload.get("nvme_version"),
+        "smartctl_device_type": device.get("type"),
+        "protocol": device.get("protocol"),
+    }
+
+
+def _smartctl_scan_candidates_linux(runner: Runner) -> Dict[str, Dict[str, Any]]:
+    """Return block devices mentioned by smartctl scans.
+
+    Plain --scan can reveal devices that --scan-open cannot open for the
+    current user, so merge both.  Device type/comment are retained because an
+    SNT/NVMe hint is useful even when a subsequent information probe needs root.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for argv in (["smartctl", "--scan-open"], ["smartctl", "--scan"]):
+        res = runner.run(argv, timeout=12.0)
+        if not res.available or not res.stdout:
+            continue
+        for raw in res.stdout.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.match(r"^(\S+)(?:\s+-d\s+(\S+))?(?:\s+#\s*(.*))?$", line)
+            if not match:
+                continue
+            device, dev_type, comment = match.groups()
+            name = Path(device).name
+            if not re.fullmatch(r"sd[a-z]+", name):
+                continue
+            row = out.setdefault(device, {"device": device})
+            if dev_type:
+                row["device_type"] = dev_type
+            if comment:
+                row["comment"] = comment
+    return out
+
+
+def _usb_solid_state_candidates_linux(sys_class_block: Path = SYS_CLASS_BLOCK) -> Dict[str, Dict[str, Any]]:
+    """Find USB whole-disk sdX devices that look solid-state from sysfs.
+
+    This is deliberately a *candidate* source.  USB bridges hide the underlying
+    protocol, so NVMe identity is confirmed by smartctl when permissions allow.
+    Keeping candidates lets an unprivileged `list` at least show that a physical
+    external SSD exists and needs a privileged protocol probe.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not sys_class_block.exists():
+        return out
+    for path in sorted(sys_class_block.glob("sd*")):
+        if not re.fullmatch(r"sd[a-z]+", path.name):
+            continue
+        try:
+            real_device = (path / "device").resolve(strict=True)
+        except OSError:
+            continue
+        if "usb" not in str(real_device).lower():
+            continue
+        rotational = read_text(path / "queue" / "rotational")
+        if rotational not in (None, "0"):
+            continue
+        model = read_text(path / "device" / "model")
+        vendor = read_text(path / "device" / "vendor")
+        label = " ".join(x for x in (vendor, model) if x).strip() or None
+        out[f"/dev/{path.name}"] = {
+            "device": f"/dev/{path.name}",
+            "bridge_model": label,
+            "sysfs_usb": True,
+        }
+    return out
+
+
+def discover_controllers_linux(
+    sys_class_nvme: Path = SYS_CLASS_NVME,
+    runner: Optional[Runner] = None,
+    sys_class_block: Path = SYS_CLASS_BLOCK,
+) -> List[Dict[str, Any]]:
+    """Discover both native NVMe and USB/SCSI-translated NVMe devices."""
+    runner = runner or Runner()
+    result = _discover_native_controllers_linux(sys_class_nvme)
+    seen = {str(item.get("device")) for item in result}
+
+    candidates = _smartctl_scan_candidates_linux(runner)
+    for device, row in _usb_solid_state_candidates_linux(sys_class_block).items():
+        candidates.setdefault(device, {}).update({k: v for k, v in row.items() if v is not None})
+
+    for device in sorted(candidates):
+        if device in seen:
+            continue
+        candidate = candidates[device]
+        scan_hint = " ".join(
+            str(candidate.get(key) or "") for key in ("device_type", "comment")
+        ).lower()
+        likely_nvme = "nvme" in scan_hint or "snt" in scan_hint
+
+        # Identification is intentionally cheap; full SMART is collected only
+        # by `check`.  smartctl may return non-zero status bits while still
+        # producing valid JSON, so parse stdout regardless of return code.
+        probe = runner.run(["smartctl", "-i", "-j", device], timeout=10.0)
+        payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
+        if _smartctl_json_is_nvme(payload):
+            ident = _smartctl_identity(payload)
+            result.append({
+                "controller": Path(device).name,
+                "device": device,
+                "model": ident.get("model") or candidate.get("bridge_model"),
+                "serial": ident.get("serial"),
+                "firmware": ident.get("firmware"),
+                "state": "present",
+                "transport": "USB -> NVMe" if candidate.get("sysfs_usb") or "usb" in scan_hint else "translated NVMe",
+                "smartctl_device_type": ident.get("smartctl_device_type") or candidate.get("device_type"),
+                "protocol": "NVMe",
+                "native_nvme": False,
+            })
+            continue
+
+        # If smartctl's scan already identifies an NVMe/SNT bridge, keep it in
+        # the inventory even when the current user cannot open it.
+        if likely_nvme:
+            result.append({
+                "controller": Path(device).name,
+                "device": device,
+                "model": candidate.get("bridge_model"),
+                "serial": None,
+                "firmware": None,
+                "state": "limited",
+                "transport": "USB -> NVMe",
+                "smartctl_device_type": candidate.get("device_type"),
+                "protocol": "NVMe",
+                "native_nvme": False,
+                "probe_note": "NVMe bridge detected; run list/check as root for identity/health access",
+            })
+            continue
+
+        # Last-resort visibility for an unprivileged list: show a USB solid-state
+        # block device as an *unverified candidate*, never as confirmed NVMe.
+        if candidate.get("sysfs_usb") and (not probe.available or probe.returncode != 0 or payload is None):
+            result.append({
+                "controller": Path(device).name,
+                "device": device,
+                "model": candidate.get("bridge_model"),
+                "serial": None,
+                "firmware": None,
+                "state": "probe-needed",
+                "transport": "USB SSD (NVMe unverified)",
+                "native_nvme": False,
+                "probe_note": "protocol could not be identified without SMART access; rerun with sudo",
+            })
+
     return result
 
 
@@ -305,6 +477,55 @@ def collect_topology_linux(
     """
     runner = runner or Runner()
     controller, device_path = normalize_device(requested_device)
+    if not _is_native_linux_nvme(controller):
+        block = sys_class_block / controller
+        ci: Dict[str, Any] = {
+            "state": "present" if block.exists() else "missing",
+            "transport": "USB/SCSI -> NVMe",
+            "native_nvme": False,
+        }
+        probe = runner.run(["smartctl", "-i", "-j", device_path], timeout=10.0)
+        payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
+        if _smartctl_json_is_nvme(payload):
+            ident = _smartctl_identity(payload)
+            ci.update({
+                "model": ident.get("model"),
+                "serial": ident.get("serial"),
+                "firmware_rev": ident.get("firmware"),
+                "nvme_version": ident.get("nvme_version"),
+                "protocol": "NVMe",
+            })
+        ns: Dict[str, Any] = {"name": controller, "device": device_path}
+        sectors = read_text(block / "size")
+        logical = read_text(block / "queue" / "logical_block_size")
+        try:
+            if sectors is not None:
+                ns["capacity_bytes"] = int(sectors) * 512
+        except ValueError:
+            pass
+        try:
+            if logical is not None:
+                ns["logical_block_size"] = int(logical)
+        except ValueError:
+            pass
+        return {
+            "platform": "linux",
+            "requested_device": requested_device,
+            "controller": controller,
+            "controller_device": device_path,
+            "controller_info": ci,
+            "numa_node": None,
+            "local_cpulist": None,
+            "pci_domain": None,
+            "pci_endpoint": {},
+            "pci_path": [],
+            "namespaces": [ns],
+            "complete": False,
+            "notes": [
+                "This NVMe device is accessed through a USB/SCSI bridge. The bridge hides the SSD's native PCIe endpoint, PCIe generation/link, AER and NUMA ancestry; topology can only show the host block-device endpoint."
+            ],
+        }
+
     controller_path = sys_class_nvme / controller
     if not controller_path.exists():
         raise ValueError(f"{controller_path} is not present; controller may be disconnected or removed")
@@ -425,6 +646,46 @@ def _kernel_log(runner: Runner, controller: str, bdfs: List[str], max_lines: int
     return selected[-max_lines:]
 
 
+
+
+def _apply_smartctl_nvme_payload(snapshot: Snapshot, payload: Dict[str, Any], *, translated: bool = False) -> None:
+    """Merge smartctl NVMe JSON into a Snapshot."""
+    snapshot.tools["smartctl"] = payload
+    ident = _smartctl_identity(payload)
+    ci = snapshot.controller_info
+    if ident.get("model"):
+        ci["model"] = ident["model"]
+    if ident.get("serial"):
+        ci["serial"] = ident["serial"]
+    if ident.get("firmware"):
+        ci["firmware_rev"] = ident["firmware"]
+    if ident.get("nvme_version") is not None:
+        ci["nvme_version"] = ident["nvme_version"]
+    if ident.get("smartctl_device_type"):
+        ci["smartctl_device_type"] = ident["smartctl_device_type"]
+    if ident.get("protocol"):
+        ci["protocol"] = ident["protocol"]
+    if translated:
+        ci["state"] = "present"
+        ci["transport"] = "USB -> NVMe"
+        ci["native_nvme"] = False
+        ci["nvme_passthrough"] = True
+
+    fallback = payload.get("nvme_smart_health_information_log")
+    if isinstance(fallback, dict):
+        snapshot.smart = fallback
+        snapshot.capabilities["nvme_smart"] = True
+
+    for key in ("nvme_error_information_log", "nvme_error_log"):
+        if payload.get(key) is not None:
+            snapshot.error_log = payload.get(key)
+            snapshot.capabilities["nvme_error_log"] = True
+            break
+
+
+def _is_native_linux_nvme(controller: str) -> bool:
+    return bool(re.fullmatch(r"nvme\d+", controller))
+
 def collect_snapshot_linux(
     requested_device: str,
     runner: Optional[Runner] = None,
@@ -434,6 +695,7 @@ def collect_snapshot_linux(
 ) -> Snapshot:
     runner = runner or Runner()
     controller, device_path = normalize_device(requested_device)
+    native_nvme = _is_native_linux_nvme(controller)
     snapshot = Snapshot(requested_device, controller, device_path)
     snapshot.host = {
         "platform": "linux",
@@ -449,18 +711,58 @@ def collect_snapshot_linux(
         "nvme_smart": False,
         "nvme_error_log": False,
         "device_inventory": True,
-        "pcie_link": True,
-        "pcie_aer": True,
-        "pcie_topology": True,
-        "power_management": True,
+        "pcie_link": native_nvme,
+        "pcie_aer": native_nvme,
+        "pcie_topology": native_nvme,
+        "power_management": native_nvme,
         "targeted_kernel_log": True,
     }
+
+    if not native_nvme:
+        # USB/SCSI-translated NVMe appears as /dev/sdX. nvme-cli and native
+        # NVMe sysfs cannot address that path, but smartctl can on Linux when
+        # the bridge supports NVMe admin passthrough (as proven by smartctl -a).
+        snapshot.controller_info.update({
+            "state": "present",
+            "sysfs_present": (SYS_CLASS_BLOCK / controller).exists(),
+            "transport": "USB/SCSI -> NVMe",
+            "native_nvme": False,
+        })
+        smartctl = _read_tool_json(
+            runner,
+            ["smartctl", "-a", "-j", device_path],
+            snapshot.collection_notes,
+            accept_json_on_nonzero=True,
+        )
+        if isinstance(smartctl, dict) and _smartctl_json_is_nvme(smartctl):
+            _apply_smartctl_nvme_payload(snapshot, smartctl, translated=True)
+            snapshot.collection_notes.append(
+                "NVMe is accessed through a USB/SCSI block device; native nvme-cli, PCIe AER/link, NUMA and endpoint topology are hidden by the bridge"
+            )
+        elif isinstance(smartctl, dict):
+            snapshot.tools["smartctl"] = smartctl
+            snapshot.controller_info["nvme_passthrough"] = False
+            snapshot.controller_info["passthrough_reason"] = "linux-smartctl-not-nvme"
+            snapshot.collection_notes.append(
+                f"{device_path} is a block device, but smartctl did not identify an NVMe protocol behind it"
+            )
+        else:
+            snapshot.controller_info["nvme_passthrough"] = False
+            snapshot.controller_info["passthrough_reason"] = "linux-smartctl-unavailable"
+
+        # Keep kernel evidence scoped to the block-device name.  This can catch
+        # USB/SCSI resets/disconnects even though the native NVMe PCIe BDF is
+        # intentionally unavailable through the bridge.
+        snapshot.kernel_lines = _kernel_log(runner, controller, [], kernel_lines)
+        snapshot.collection_notes = list(dict.fromkeys(snapshot.collection_notes))
+        return snapshot
 
     controller_path = sys_class_nvme / controller
     if controller_path.exists():
         snapshot.controller_info.update(_collect_controller_sysfs(controller_path))
+        snapshot.controller_info["native_nvme"] = True
     else:
-        snapshot.controller_info.update({"state": "missing", "sysfs_present": False})
+        snapshot.controller_info.update({"state": "missing", "sysfs_present": False, "native_nvme": True})
         snapshot.collection_notes.append(f"{controller_path} is not present; controller may be disconnected or removed")
 
     bdf = _bdf_for_controller(controller_path) if controller_path.exists() else None
@@ -477,8 +779,6 @@ def collect_snapshot_linux(
     ctrl = _read_tool_json(runner, ["nvme", "id-ctrl", device_path, "-o", "json"], snapshot.collection_notes)
     if isinstance(ctrl, dict):
         snapshot.controller_info["nvme_id_ctrl"] = ctrl
-        # Promote a few high-value identity/capability fields so renderers do
-        # not have to depend on one nvme-cli JSON spelling forever.
         if ctrl.get("ver") is not None:
             snapshot.controller_info["nvme_version_raw"] = ctrl.get("ver")
         for key in ("tnvmcap", "unvmcap", "nn", "vwc"):
@@ -494,7 +794,7 @@ def collect_snapshot_linux(
         snapshot.error_log = errors
         snapshot.capabilities["nvme_error_log"] = True
 
-    # smartctl is supplemental. Keep its JSON without making it mandatory.
+    # smartctl is supplemental for native NVMe and fallback health evidence.
     smartctl = _read_tool_json(
         runner,
         ["smartctl", "-a", "-j", device_path],
@@ -502,17 +802,17 @@ def collect_snapshot_linux(
         accept_json_on_nonzero=True,
     )
     if isinstance(smartctl, dict):
-        snapshot.tools["smartctl"] = smartctl
-        if smartctl.get("nvme_version") is not None and not snapshot.controller_info.get("nvme_version"):
-            snapshot.controller_info["nvme_version"] = smartctl.get("nvme_version")
-        # smartctl is a useful fallback if nvme-cli is absent or fails.
-        # Its NVMe health fields map closely to nvme-cli's SMART JSON.
-        if not snapshot.smart:
-            fallback = smartctl.get("nvme_smart_health_information_log")
-            if isinstance(fallback, dict):
-                snapshot.smart = fallback
-                snapshot.capabilities["nvme_smart"] = True
-                snapshot.collection_notes.append("using smartctl NVMe health JSON as fallback because nvme-cli SMART data was unavailable")
+        # Keep nvme-cli SMART authoritative when available, but use smartctl to
+        # enrich identity/version and as the fallback health source.
+        existing_smart = snapshot.smart
+        _apply_smartctl_nvme_payload(snapshot, smartctl, translated=False)
+        if existing_smart:
+            snapshot.smart = existing_smart
+            snapshot.capabilities["nvme_smart"] = True
+        elif snapshot.smart:
+            snapshot.collection_notes.append(
+                "using smartctl NVMe health JSON as fallback because nvme-cli SMART data was unavailable"
+            )
 
     if bdf:
         lspci = runner.run(["lspci", "-vv", "-s", bdf], timeout=8.0)
@@ -539,7 +839,7 @@ def discover_controllers(
         from .collect_macos import discover_controllers_macos
         return discover_controllers_macos(runner=runner)
     if key == "linux":
-        return discover_controllers_linux(sys_class_nvme=sys_class_nvme)
+        return discover_controllers_linux(sys_class_nvme=sys_class_nvme, runner=runner)
     return []
 
 
@@ -550,11 +850,14 @@ def collect_snapshot(
     sys_pci: Path = SYS_PCI,
     kernel_lines: int = 300,
     platform_name: Optional[str] = None,
+    direct_usb: bool = False,
 ) -> Snapshot:
     key = platform_key(platform_name)
     if key == "darwin":
         from .collect_macos import collect_snapshot_macos
-        return collect_snapshot_macos(requested_device, runner=runner, kernel_lines=kernel_lines)
+        return collect_snapshot_macos(
+            requested_device, runner=runner, kernel_lines=kernel_lines, direct_usb=direct_usb
+        )
     if key == "linux":
         return collect_snapshot_linux(
             requested_device, runner=runner, sys_class_nvme=sys_class_nvme,

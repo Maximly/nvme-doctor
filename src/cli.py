@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -57,10 +58,14 @@ def _write_output(text: str, output: Optional[str]) -> None:
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("device", nargs="?", help="NVMe controller or namespace, e.g. /dev/nvme0 or /dev/nvme0n1")
+    parser.add_argument("device", nargs="?", help="NVMe controller/namespace or USB-translated block device, e.g. /dev/nvme0, /dev/nvme0n1, or /dev/sdf")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--verbose", "-v", action="store_true", help="include PCI topology and relevant kernel log lines")
     parser.add_argument("--kernel-lines", type=int, default=300, help="maximum number of relevant kernel log lines to keep (default: 300)")
+    parser.add_argument(
+        "--direct-usb", action="store_true",
+        help="macOS RTL9210 only: temporarily unmount/capture the USB enclosure and read NVMe Identify/SMART directly (requires sudo + libusb)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,7 +112,7 @@ def _normalize_argv(argv: List[str]) -> List[str]:
     known = {"list", "check", "topology", "report", "diff", "watch", "-h", "--help", "--version"}
     if argv[0] not in known:
         name = Path(argv[0]).name
-        if "nvme" in name or name.startswith("disk") or name.startswith("rdisk"):
+        if "nvme" in name or name.startswith("disk") or name.startswith("rdisk") or re.fullmatch(r"sd[a-z]+(?:\d+)?", name):
             return ["check"] + argv
     return argv
 
@@ -137,18 +142,98 @@ def command_list(args: argparse.Namespace) -> int:
     if not controllers:
         print(f"No NVMe devices found by the {platform_label()} backend.")
         return EXIT_WARNING
-    print(f"{'Controller':<12} {'State':<12} {'Model':<36} {'Firmware':<12} Serial")
+    print(f"{'Controller':<12} {'State':<12} {'Transport':<14} {'Model':<36} {'Firmware':<12} Serial")
     for item in controllers:
         print(
             f"{item.get('controller','-'):<12} {str(item.get('state') or '-'):<12} "
+            f"{str(item.get('transport') or '-')[:13]:<14} "
             f"{str(item.get('model') or '-')[:35]:<36} {str(item.get('firmware') or '-'):<12} {item.get('serial') or '-'}"
         )
     return EXIT_OK
 
 
+def _direct_usb_auto_permission(
+    device: str,
+    args: argparse.Namespace,
+    snapshot,
+    *,
+    output: Optional[str] = None,
+) -> bool:
+    """Decide whether a normal macOS check may use direct RTL9210 access.
+
+    Explicit --direct-usb always wins.  Without it, an already-unmounted disk
+    may be read automatically.  A mounted disk requires an interactive yes/no
+    confirmation.  JSON/non-interactive/report automation never gets an
+    implicit unmount; scripts must pass --direct-usb explicitly.
+    """
+    if getattr(args, "direct_usb", False):
+        return True
+    if platform_key() != "darwin":
+        return False
+    if not snapshot.controller_info.get("direct_usb"):
+        return False
+    if snapshot.capabilities.get("nvme_smart"):
+        return False
+    if os.geteuid() != 0:
+        return False
+
+    try:
+        from .macos_usb_nvme import mounted_volumes
+        mounts = mounted_volumes(device)
+    except Exception:
+        mounts = None
+
+    # Machine-readable/non-interactive use must never acquire permission by
+    # surprise, even when no filesystem is currently mounted. --direct-usb is
+    # the explicit automation opt-in.
+    if args.json or output or not sys.stdin.isatty() or not sys.stderr.isatty():
+        return False
+
+    # In an interactive terminal, if we can prove nothing is mounted, direct
+    # access can proceed automatically without a filesystem disruption.
+    if mounts == []:
+        return True
+
+    print(
+        f"NVMe SMART for {snapshot.controller_info.get('model') or device} requires temporary exclusive USB access.",
+        file=sys.stderr,
+    )
+    if mounts:
+        print("Mounted volumes:", file=sys.stderr)
+        for mount in mounts:
+            print(f"  {mount}", file=sys.stderr)
+    else:
+        print("Mounted-volume state could not be determined reliably.", file=sys.stderr)
+    print(
+        "NVMe Doctor will temporarily unmount the disk if needed, read NVMe Identify/SMART, then restore it.",
+        file=sys.stderr,
+    )
+    try:
+        print("Continue? [y/N] ", end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return False
+    return answer in {"y", "yes"}
+
+
 def command_check(args: argparse.Namespace, output: Optional[str] = None) -> int:
     device = _device_or_error(args.device)
-    snapshot = collect_snapshot(device, kernel_lines=max(20, args.kernel_lines))
+    explicit_direct = bool(getattr(args, "direct_usb", False))
+    if explicit_direct and platform_key() != "darwin":
+        raise ValueError("--direct-usb is currently supported only on macOS with Realtek RTL9210 USB-NVMe bridges")
+
+    # Ordinary macOS external-USB collection is intentionally fast and
+    # non-disruptive.  It classifies the target and direct-USB capability first.
+    snapshot = collect_snapshot(
+        device, kernel_lines=max(20, args.kernel_lines), direct_usb=explicit_direct
+    )
+
+    if not explicit_direct and _direct_usb_auto_permission(device, args, snapshot, output=output):
+        snapshot = collect_snapshot(
+            device, kernel_lines=max(20, args.kernel_lines), direct_usb=True
+        )
+
     report = diagnose(snapshot)
     text = render_json(report) if args.json else render_text(report, verbose=args.verbose)
     _write_output(text, output)

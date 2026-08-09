@@ -12,7 +12,9 @@ NVMe Doctor is GPL-3.0-or-later software from KernelSoft.
 
 ## Status
 
-`0.4.0` adds a dedicated hardware-topology command that traces NUMA locality through the PCIe ancestry to the NVMe controller and namespaces, including per-hop link capabilities and down-training checks. It retains the richer health/lifetime diagnostics and Linux/macOS backends from earlier releases. The normal diagnostic path is **read-only**. NVMe Doctor does not automatically reset controllers, change ASPM/APST or other power settings, format namespaces, sanitize drives, or flash firmware.
+Version **1.0.1** is the consolidated public release.
+
+The repository contains both the maintainable flat source tree under `src/` and a pre-built standalone `nvme-doctor` executable. The standalone file contains all Python modules required by NVMe Doctor and can be copied directly to another Linux or macOS system with Python 3.9+.
 
 ## Quick start
 
@@ -26,18 +28,50 @@ cd nvme-doctor
 sudo ./nvme-doctor check nvme0
 ```
 
+Native NVMe devices are discovered from `/sys/class/nvme`. USB/SCSI-translated NVMe devices can appear as `/dev/sdX`; NVMe Doctor also consults `smartctl` scans and USB solid-state sysfs inventory so those devices are not silently omitted. If an unprivileged `list` cannot open the bridge, it may show the device as `probe-needed`; rerun `sudo nvme-doctor list` to verify the underlying NVMe identity.
+
+Example:
+
+```bash
+nvme-doctor list
+sudo nvme-doctor check sdf
+sudo nvme-doctor check /dev/sdf
+```
+
+When `/dev/sdX` is confirmed as NVMe, SMART/Health is valid, but native PCIe link generation, AER counters and NUMA locality are hidden by the bridge and are reported as unavailable rather than clean.
+
 ### macOS
 
-The built-in macOS backend can discover native NVMe devices with `system_profiler`. Full NVMe SMART/Health data requires `smartctl` from smartmontools.
+Native NVMe and external physical USB SSDs are discovered separately from SMART access. Native NVMe uses `system_profiler` plus `smartctl` when available. Synthesized APFS containers are excluded.
 
 With Homebrew:
 
 ```bash
-brew install smartmontools
+brew install smartmontools libusb
 git clone https://github.com/KernelSoft/nvme-doctor.git
 cd nvme-doctor
 sudo ./nvme-doctor check disk0
 ```
+
+For a Realtek RTL9210 USB-NVMe enclosure, ordinary interactive `check` now uses the direct backend automatically when it is safe. If the disk is already unmounted, it proceeds directly. If mounted volumes are detected, NVMe Doctor asks once before temporarily unmounting/capturing the enclosure:
+
+```text
+NVMe SMART for the external SSD requires temporary exclusive USB access.
+Mounted volumes:
+  /Volumes/External
+NVMe Doctor will temporarily unmount the disk if needed, read NVMe Identify/SMART, then restore it.
+Continue? [y/N]
+```
+
+For JSON, reports, scripts, cron, or any non-interactive invocation, pass explicit permission:
+
+```bash
+sudo ./nvme-doctor check disk4 --direct-usb
+```
+
+Direct mode temporarily unmounts the whole external disk, captures the RTL9210 USB storage interface, selects its BOT alternate setting, sends read-only NVMe Identify (`0x06`) and SMART/Get Log Page (`0x02`, LID `0x02`) commands through the RTL9210 `0xE4` tunnel, then releases the USB device and remounts it. Close applications using that disk first. To avoid capturing the wrong enclosure, direct mode currently refuses to run when multiple external USB SSDs or multiple RTL9210 bridges are connected.
+
+Current smartmontools Darwin builds still cannot use the SCSI pass-through layer required by `sntrealtek` directly on `/dev/diskN`; NVMe Doctor's RTL9210 backend bypasses that limitation with libusb. Other bridge chipsets remain `INCOMPLETE` unless macOS/smartctl exposes a usable NVMe path.
 
 If the Mac has exactly one discoverable NVMe device, the device may be omitted:
 
@@ -45,7 +79,31 @@ If the Mac has exactly one discoverable NVMe device, the device may be omitted:
 sudo ./nvme-doctor check
 ```
 
-The repository launcher uses only Python's standard library; there are no pip dependencies for normal use. Python 3.9+ is required.
+The pre-built `./nvme-doctor` file uses only Python's standard library. Python 3.9+ is required. Optional platform tools such as `nvme-cli`, `smartctl`, `lspci`, and libusb enable additional evidence paths.
+
+## Single-file distribution and installation
+
+The root-level `nvme-doctor` file is pre-built and standalone:
+
+```bash
+cp nvme-doctor ~/bin/
+chmod +x ~/bin/nvme-doctor
+~/bin/nvme-doctor --version
+```
+
+To rebuild it from the flat source tree:
+
+```bash
+make build
+```
+
+To install system-wide:
+
+```bash
+sudo ./install.sh install
+```
+
+`install.sh` always rebuilds the standalone executable from `src/*.py` before installing it to `$PREFIX/bin/nvme-doctor` (default `/usr/local/bin/nvme-doctor`). Source modules are not required after installation.
 
 ## Platform capabilities
 
@@ -55,13 +113,13 @@ Linux exposes considerably more low-level PCIe/NVMe evidence than macOS. NVMe Do
 |---|---|---|
 | NVMe SMART/Health | `nvme-cli`, fallback `smartctl` | `smartctl` |
 | NVMe error information | `nvme-cli`, supplemental `smartctl` | `smartctl` when exposed |
-| Device discovery | sysfs | `system_profiler SPNVMeDataType` + `smartctl --scan[-open]` |
+| Device discovery | sysfs | `system_profiler` + `diskutil` + merged `smartctl --scan-open` / `--scan` |
 | PCIe link speed/width | sysfs | partial, where `system_profiler` exposes it |
 | PCIe AER counters | yes | not exposed by this backend |
 | PCIe ancestry/topology | yes | not exposed by this backend |
 | ASPM/APST context | yes | not exposed by this backend |
 | Target-scoped OS logs | current-boot kernel log | only when a stable target identity can be matched |
-| USB-NVMe bridge type | via normal Linux tools | preserves `smartctl -d ...` hints from scan results |
+| USB-NVMe bridge health | via Linux SCSI/SNT pass-through when supported | RTL9210 direct USB backend with explicit `--direct-usb`; otherwise capability-dependent |
 
 A macOS report therefore includes a `CAPABILITIES` section such as:
 
@@ -157,6 +215,7 @@ Power management is deliberately handled as a **hypothesis**. NVMe Doctor does n
 - records macOS `SMART Status` as context, but does **not** treat `Verified` alone as a complete NVMe health assessment;
 - preserves `smartctl --scan-open` device types such as `nvme` or USB-NVMe bridge types (`snt...`) and reuses them for the health query;
 - never lets an unscoped macOS storage log event create a target-specific reset/timeout diagnosis.
+- can directly read Identify Controller and SMART/Health from one Realtek RTL9210 enclosure with explicit `--direct-usb` using libusb; this temporarily unmounts/captures/remounts the disk.
 
 ## Hardware topology
 
@@ -276,7 +335,7 @@ The detailed `FINDINGS / EVIDENCE` section explains why each non-clean condition
 ./nvme-doctor list
 ```
 
-Linux examples are normally `nvme0`, `/dev/nvme0`, or a namespace such as `/dev/nvme0n1`.
+Linux examples include native `nvme0`, `/dev/nvme0`, or `/dev/nvme0n1`, and USB/SCSI-translated NVMe targets such as `sdf` or `/dev/sdf`.
 
 macOS examples are normally `disk0` or `/dev/disk0`. Raw-device and slice forms such as `/dev/rdisk0` and `disk0s1` are normalized to `/dev/disk0`.
 

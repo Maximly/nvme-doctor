@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 _NVME_RE = re.compile(r"^(nvme\d+)(?:n\d+(?:p\d+)?)?$")
+_LINUX_SD_RE = re.compile(r"^(sd[a-z]+)(?:\d+)?$")
 _MAC_DISK_RE = re.compile(r"^(?:r)?(disk\d+)(?:s\d+)?$")
 _BDF_RE = re.compile(r"^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
 
@@ -21,9 +22,24 @@ def controller_from_device(value: str) -> str:
 
 
 def normalize_device(value: str) -> Tuple[str, str]:
-    """Normalize a Linux NVMe controller/namespace to its controller device."""
-    controller = controller_from_device(value)
-    return controller, f"/dev/{controller}"
+    """Normalize a Linux NVMe target.
+
+    Native NVMe controller/namespace names are normalized to /dev/nvmeX.
+    USB/SCSI-translated NVMe devices may appear as /dev/sdX; whole-device and
+    partition spellings are accepted and normalized to the whole block device.
+    Whether an sdX target is actually NVMe is verified by the Linux collector
+    through smartctl rather than assumed from its block-device name.
+    """
+    name = Path(value).name
+    match = _NVME_RE.match(name)
+    if match:
+        controller = match.group(1)
+        return controller, f"/dev/{controller}"
+    match = _LINUX_SD_RE.match(name)
+    if match:
+        disk = match.group(1)
+        return disk, f"/dev/{disk}"
+    raise ValueError(f"not a Linux NVMe controller/namespace or supported USB/SCSI block target: {value}")
 
 
 def normalize_macos_device(value: str) -> Tuple[str, str]:

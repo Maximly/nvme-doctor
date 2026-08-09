@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvme-doctor"
-version = "0.4.2"
+version = "1.0.1"
 description = "NVMe SSD diagnostics and root-cause analyzer for Linux and macOS"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,7 +16,7 @@ keywords = [
   "nvme", "ssd", "linux", "macos", "diagnostics", "pcie", "smart", "aer", "storage"
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: System Administrators",
   "Intended Audience :: Developers",

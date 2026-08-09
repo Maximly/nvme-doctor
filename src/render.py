@@ -253,6 +253,13 @@ def render_text(report: Report, verbose: bool = False) -> str:
     if capacity:
         lines.append(f"  NVM capacity         {capacity}")
     lines.append(f"  State                {_v(ci.get('state'))}")
+    if ci.get("transport"):
+        transport = str(ci.get("transport"))
+        if ci.get("bus_protocol") and str(ci.get("bus_protocol")).lower() not in transport.lower():
+            transport += f" ({ci.get('bus_protocol')})"
+        lines.append(f"  Transport            {transport}")
+    if ci.get("smartctl_device_type") and str(ci.get("smartctl_device_type")).lower().startswith("snt"):
+        lines.append(f"  USB bridge backend   {ci.get('smartctl_device_type')}")
     if pci:
         if pci.get("bdf"):
             lines.append(f"  PCI address          {_v(pci.get('bdf'))}")
@@ -364,7 +371,12 @@ def render_text(report: Report, verbose: bool = False) -> str:
                 lines.append(f"  {line}")
 
     lines.append("")
-    lines.append("Safety: NVMe Doctor is diagnostic-only; it does not reset controllers or change OS/storage power settings.")
+    if ci.get("direct_usb") and s.capabilities.get("nvme_smart"):
+        lines.append(
+            "Safety: direct USB mode used read-only NVMe Identify/SMART commands; it temporarily unmounted/captured the enclosure, then released and remounted it."
+        )
+    else:
+        lines.append("Safety: NVMe Doctor is diagnostic-only; it does not reset controllers or change OS/storage power settings.")
     return "\n".join(lines) + "\n"
 
 

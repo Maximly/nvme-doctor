@@ -43,4 +43,4 @@ NVMe Doctor keeps two concepts separate:
 
 `unsafe_shutdowns` is a cumulative SMART lifetime counter. It is high-confidence evidence that a normal NVMe shutdown notification was not received before a power-loss event, but it contains no per-event timestamp or reason. NVMe Doctor therefore never attributes an historical unsafe shutdown to a specific PSU, OS crash, reset, firmware bug, enclosure, or user action from this counter alone.
 
-For controlled experiments, save JSON reports before and after the event and use `nvme-doctor diff`. Counter deltas can establish that an unsafe shutdown happened in that interval; exact cause still requires host/platform evidence.
+For controlled before/after checks, save JSON reports around the event and use `nvme-doctor diff`. Counter deltas can establish that an unsafe shutdown happened in that interval; exact cause still requires host/platform evidence.
