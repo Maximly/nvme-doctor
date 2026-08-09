@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvme-doctor"
+version = "0.4.2"
+description = "NVMe SSD diagnostics and root-cause analyzer for Linux and macOS"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "GPL-3.0-or-later"}
+authors = [
+  {name = "KernelSoft"}
+]
+keywords = [
+  "nvme", "ssd", "linux", "macos", "diagnostics", "pcie", "smart", "aer", "storage"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/KernelSoft/nvme-doctor"
+Repository = "https://github.com/KernelSoft/nvme-doctor"
+Issues = "https://github.com/KernelSoft/nvme-doctor/issues"
+
+[project.scripts]
+nvme-doctor = "nvme_doctor.cli:main"
+
+[tool.setuptools]
+packages = ["nvme_doctor"]
+package-dir = {"nvme_doctor" = "src"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
