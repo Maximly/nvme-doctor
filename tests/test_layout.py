@@ -18,7 +18,7 @@ def test_flat_source_layout_and_standalone_executable(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "nvme-doctor 1.0.1"
+    assert result.stdout.strip() == "nvme-doctor 1.0.3"
 
     rebuilt = tmp_path / "nvme-doctor"
     build = subprocess.run(

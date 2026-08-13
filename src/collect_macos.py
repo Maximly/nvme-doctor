@@ -565,6 +565,7 @@ def _populate_external_usb_snapshot(
         "backend": "diskutil",
         "state": "limited",
         "model": physical.get("model"),
+        "usb_bridge_model": physical.get("model"),
         "serial": physical.get("serial"),
         "firmware_rev": physical.get("firmware"),
         "transport": "USB SSD",
@@ -588,6 +589,8 @@ def _populate_external_usb_snapshot(
                 "bus_protocol": "USB",
                 "usb_bridge": "Realtek RTL9210",
                 "usb_vid_pid": "0bda:9210",
+                "usb_bridge_model": physical.get("model"),
+                "usb_bridge_manufacturer": bridge.get("manufacturer"),
                 "usb_bridge_product": bridge.get("product"),
                 "nvme_passthrough": True,
                 "direct_usb": True,
@@ -633,6 +636,8 @@ def _populate_external_usb_snapshot(
             "direct_usb": True,
             "usb_bridge": "Realtek RTL9210",
             "usb_vid_pid": "0bda:9210",
+            "usb_bridge_model": physical.get("model"),
+            "usb_bridge_manufacturer": bridge.get("manufacturer"),
             "usb_bridge_product": bridge.get("product"),
         })
         snapshot.collection_notes.append(

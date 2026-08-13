@@ -12,7 +12,7 @@ NVMe Doctor is GPL-3.0-or-later software from KernelSoft.
 
 ## Status
 
-Version **1.0.1** is the consolidated public release.
+Version **1.0.3** is the consolidated public release.
 
 The repository contains both the maintainable flat source tree under `src/` and a pre-built standalone `nvme-doctor` executable. The standalone file contains all Python modules required by NVMe Doctor and can be copied directly to another Linux or macOS system with Python 3.9+.
 
@@ -119,7 +119,7 @@ Linux exposes considerably more low-level PCIe/NVMe evidence than macOS. NVMe Do
 | PCIe ancestry/topology | yes | not exposed by this backend |
 | ASPM/APST context | yes | not exposed by this backend |
 | Target-scoped OS logs | current-boot kernel log | only when a stable target identity can be matched |
-| USB-NVMe bridge health | via Linux SCSI/SNT pass-through when supported | RTL9210 direct USB backend with explicit `--direct-usb`; otherwise capability-dependent |
+| USB-NVMe bridge health | via Linux SCSI/SNT pass-through when supported | RTL9210 direct USB backend; automatic when safely unmounted, interactive confirmation when mounted, explicit `--direct-usb` for non-interactive use |
 
 A macOS report therefore includes a `CAPABILITIES` section such as:
 
@@ -215,7 +215,7 @@ Power management is deliberately handled as a **hypothesis**. NVMe Doctor does n
 - records macOS `SMART Status` as context, but does **not** treat `Verified` alone as a complete NVMe health assessment;
 - preserves `smartctl --scan-open` device types such as `nvme` or USB-NVMe bridge types (`snt...`) and reuses them for the health query;
 - never lets an unscoped macOS storage log event create a target-specific reset/timeout diagnosis.
-- can directly read Identify Controller and SMART/Health from one Realtek RTL9210 enclosure with explicit `--direct-usb` using libusb; this temporarily unmounts/captures/remounts the disk.
+- can directly read Identify Controller and SMART/Health from one Realtek RTL9210 enclosure using libusb; interactive commands use the direct path automatically when safe and ask before temporarily unmounting a mounted disk, while non-interactive use requires explicit `--direct-usb`.
 
 ## Hardware topology
 
@@ -254,7 +254,7 @@ PATH CHECK
 
 For each PCIe hop NVMe Doctor reports the BDF, best-effort `lspci` description, current/max generation and width, driver, power state, and NUMA data when the kernel exposes them. A hop whose negotiated generation or width is below that device/port's own maximum is called out as down-trained.
 
-macOS does not expose an equivalent supported PCIe/NUMA ancestry through this backend, so `topology` returns the NVMe endpoint plus an explicit incomplete-topology note rather than inventing a path.
+For USB-attached NVMe, `topology` distinguishes the enclosure/USB bridge from the SSD behind it. On Linux it uses smartctl pass-through for the underlying NVMe identity when permissions allow. On macOS with one RTL9210 enclosure, interactive `sudo nvme-doctor topology diskN` uses the same safe direct-access policy as `check`: it proceeds automatically when the disk is proven unmounted, otherwise asks before temporarily unmounting/capturing it. The native SSD PCIe/NUMA/AER ancestry remains hidden by the USB bridge and is reported as such rather than invented.
 
 ## Compare before/after state
 

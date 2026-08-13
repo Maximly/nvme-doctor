@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.collect import collect_topology_linux
+from src.collect import collect_topology, collect_topology_linux
 from src.model import CommandResult
 from src.render import render_topology_text
 
@@ -117,3 +117,95 @@ def test_topology_link_can_show_negotiated_below_max():
     }
     text = render_topology_text(topo)
     assert "Gen4 x4, max Gen5 x4" in text
+
+
+class SmartctlUsbRunner:
+    def run(self, argv, timeout=8.0):
+        import json
+        if argv[:3] == ["smartctl", "-i", "-j"]:
+            payload = {
+                "device": {"name": "/dev/sdf", "protocol": "NVMe", "type": "sntrealtek"},
+                "model_name": "Samsung SSD 990 EVO Plus 2TB",
+                "serial_number": "SERUSB1",
+                "firmware_version": "1B2QKXG7",
+                "nvme_version": {"string": "2.0", "value": 131072},
+            }
+            return CommandResult(list(argv), 0, stdout=json.dumps(payload))
+        return CommandResult(list(argv), 127, available=False)
+
+
+def test_usb_translated_topology_separates_bridge_and_nvme_identity(tmp_path):
+    sys_block = tmp_path / "sys_block"
+    block = sys_block / "sdf"
+    dev = tmp_path / "devices" / "pci0000:00" / "usb1" / "1-1" / "host0" / "target0:0:0" / "0:0:0:0"
+    dev.mkdir(parents=True)
+    block.mkdir(parents=True)
+    (block / "device").symlink_to(dev, target_is_directory=True)
+    _write(block / "queue" / "rotational", "0")
+    _write(block / "device" / "vendor", "ACASIS")
+    _write(block / "device" / "model", "EC-6608Air")
+    _write(block / "size", "3907029168")
+    _write(block / "queue" / "logical_block_size", "512")
+
+    topo = collect_topology_linux("sdf", runner=SmartctlUsbRunner(), sys_class_block=sys_block)
+    assert topo["controller_info"]["model"] == "Samsung SSD 990 EVO Plus 2TB"
+    assert topo["controller_info"]["usb_bridge_model"] == "ACASIS EC-6608Air"
+    text = render_topology_text(topo)
+    assert "Bridge               ACASIS EC-6608Air" in text
+    assert "NVMe SSD — Samsung SSD 990 EVO Plus 2TB" in text
+    assert "/dev/sdf  [2.00 TB, LBA 512 B]" in text
+    assert "NUMA locality unknown" not in text
+    assert "native NVMe PCIe endpoint" in text
+
+
+def test_macos_usb_topology_render_does_not_call_bridge_nvme_endpoint():
+    topo = {
+        "platform": "darwin",
+        "controller": "disk4",
+        "controller_device": "/dev/disk4",
+        "controller_info": {
+            "model": "Samsung SSD 990 EVO Plus 2TB",
+            "serial": "SERUSB1",
+            "firmware_rev": "1B2QKXG7",
+            "transport": "USB -> NVMe",
+            "native_nvme": False,
+            "usb_bridge": "Realtek RTL9210",
+            "usb_bridge_model": "EC-6608Air",
+        },
+        "namespaces": [{"device": "/dev/disk4", "capacity_bytes": 2_000_398_934_016}],
+        "pci_endpoint": {}, "pci_path": [], "notes": [], "complete": False,
+    }
+    text = render_topology_text(topo)
+    assert "Bridge               EC-6608Air — Realtek RTL9210" in text
+    assert "NVMe SSD — Samsung SSD 990 EVO Plus 2TB" in text
+    assert "macOS NVMe endpoint" not in text
+
+
+
+def test_macos_collect_topology_uses_snapshot_device_path(monkeypatch):
+    from src.model import Snapshot
+    import src.collect_macos as collect_macos
+
+    snap = Snapshot("disk4", "disk4", "/dev/disk4")
+    snap.controller_info = {
+        "model": "Samsung SSD 990 EVO Plus 2TB",
+        "serial": "SERUSB1",
+        "firmware_rev": "1B2QKXG7",
+        "transport": "USB -> NVMe",
+        "direct_usb": True,
+        "nvme_passthrough": True,
+        "usb_bridge": "Realtek RTL9210",
+        "usb_bridge_model": "EC-6608Air",
+        "tnvmcap": 2_000_398_934_016,
+    }
+
+    monkeypatch.setattr(
+        collect_macos,
+        "collect_snapshot_macos",
+        lambda requested_device, runner=None, kernel_lines=0, direct_usb=False: snap,
+    )
+
+    topo = collect_topology("disk4", platform_name="darwin")
+    assert topo["controller_device"] == "/dev/disk4"
+    assert topo["namespaces"][0]["device"] == "/dev/disk4"
+    assert topo["controller_info"]["model"] == "Samsung SSD 990 EVO Plus 2TB"

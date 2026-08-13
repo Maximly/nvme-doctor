@@ -1,13 +1,12 @@
 # Changelog
 
-## 1.0.1 - 2026-08-09
+## 1.0.3 - 2026-08-09
 
-- Cross-platform NVMe SSD health and root-cause diagnostics for Linux and macOS.
-- Linux native-NVMe collection from sysfs, `nvme-cli`, `smartctl`, PCIe/AER state, NUMA locality, topology, and target-scoped kernel logs.
-- Linux support for NVMe SSDs exposed through USB/SCSI bridges as `/dev/sdX` when the bridge provides NVMe SMART/admin pass-through.
-- macOS native-NVMe discovery and health collection using `system_profiler`, `diskutil`, and `smartctl` where supported.
-- macOS direct read-only NVMe Identify and SMART/Health access through Realtek RTL9210 USB bridges using libusb, with controlled unmount/capture/restore handling.
-- Evidence-based verdicts (`OK`, `WARNING`, `CRITICAL`, `INCOMPLETE`) that distinguish unavailable evidence from measured-clean evidence.
-- PCIe generation/width checks, AER interpretation, controller reset/timeout correlation, endurance, thermal, lifetime-I/O, unsafe-shutdown, and error-log analysis.
-- `list`, `check`, `report`, `diff`, `topology`, and `watch` commands with text and JSON output.
-- Single-file distribution: `nvme-doctor` is a standalone executable Python file built from the flat `src/*.py` sources; `install.sh` rebuilds and installs that file.
+- Cross-platform NVMe diagnostics for Linux and macOS.
+- Native Linux NVMe SMART, error, PCIe/AER and NUMA/topology analysis.
+- USB/SCSI-translated NVMe support on Linux through smartctl pass-through.
+- Direct Realtek RTL9210 NVMe Identify and SMART access on macOS through libusb.
+- Safe automatic macOS direct-access policy: automatic when proven unmounted, interactive confirmation when mounted, explicit `--direct-usb` for non-interactive use.
+- Topology output distinguishes USB bridge identity from the underlying NVMe SSD and no longer presents enclosure names as NVMe endpoints.
+- Standalone single-file `nvme-doctor` executable, rebuilt by `install.sh` from the maintainable flat `src/*.py` source tree.
+- JSON reports, before/after diff, watch mode, lifetime/endurance and thermal interpretation.

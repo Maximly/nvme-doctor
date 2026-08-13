@@ -426,16 +426,47 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
     ci = topology.get("controller_info") or {}
     model = ci.get("model") or ci.get("model_name") or "-"
     lines.append(f"Controller           {topology.get('controller') or '-'}")
-    lines.append(f"Model                {model}")
+    if model == "-" and ci.get("identity_note"):
+        lines.append("Model                unavailable (rerun with sudo for NVMe identity)")
+    else:
+        lines.append(f"Model                {model}")
     if ci.get("serial"):
         lines.append(f"Serial               {ci.get('serial')}")
+    if ci.get("firmware_rev"):
+        lines.append(f"Firmware             {ci.get('firmware_rev')}")
+    bridge_bits = [ci.get("usb_bridge_model"), ci.get("usb_bridge")]
+    bridge_label = " — ".join(str(x) for x in bridge_bits if x)
+    if bridge_label:
+        lines.append(f"Bridge               {bridge_label}")
 
     lines.append("")
     lines.append("HARDWARE PATH")
     platform_name = topology.get("platform")
     numa = topology.get("numa_node")
     cpus = topology.get("local_cpulist")
-    if platform_name == "linux":
+    usb_translated = bool(ci.get("native_nvme") is False or ci.get("usb_bridge") or ci.get("usb_bridge_model"))
+    if usb_translated:
+        lines.append("Host USB storage path")
+        bridge = bridge_label or ci.get("usb_bridge_product") or "USB/SCSI bridge"
+        lines.append(f"└─ {bridge}")
+        nvme_model = model if model != "-" else "underlying NVMe identity unavailable"
+        lines.append(f"   └─ NVMe SSD — {nvme_model}")
+        namespaces = topology.get("namespaces") or []
+        if namespaces:
+            for idx, ns in enumerate(namespaces):
+                branch = "└─ " if idx == len(namespaces) - 1 else "├─ "
+                label = ns.get("device") or ns.get("name") or "block device"
+                extra: List[str] = []
+                if ns.get("capacity_bytes") is not None:
+                    extra.append(format_bytes_decimal(to_int(ns.get("capacity_bytes"))) or str(ns.get("capacity_bytes")))
+                if ns.get("logical_block_size") is not None:
+                    extra.append(f"LBA {ns.get('logical_block_size')} B")
+                if extra:
+                    label += "  [" + ", ".join(extra) + "]"
+                lines.append(f"      {branch}{label}")
+        else:
+            lines.append(f"      └─ {topology.get('controller_device') or topology.get('controller')}")
+    elif platform_name == "linux":
         if numa not in (None, "-1"):
             root = f"NUMA node {numa}"
             if cpus:

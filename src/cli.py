@@ -83,8 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_check)
 
     p_topology = sub.add_parser("topology", help="show NUMA -> PCIe path -> NVMe namespaces")
-    p_topology.add_argument("device", nargs="?", help="NVMe controller or namespace")
+    p_topology.add_argument("device", nargs="?", help="NVMe controller, namespace, or USB-translated block device")
     p_topology.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_topology.add_argument(
+        "--direct-usb", action="store_true",
+        help="macOS RTL9210 only: permit temporary unmount/capture to identify the underlying NVMe SSD",
+    )
 
     p_report = sub.add_parser("report", help="write a diagnostic report")
     _add_common(p_report)
@@ -186,7 +190,7 @@ def _direct_usb_auto_permission(
     # Machine-readable/non-interactive use must never acquire permission by
     # surprise, even when no filesystem is currently mounted. --direct-usb is
     # the explicit automation opt-in.
-    if args.json or output or not sys.stdin.isatty() or not sys.stderr.isatty():
+    if getattr(args, "json", False) or output or not sys.stdin.isatty() or not sys.stderr.isatty():
         return False
 
     # In an interactive terminal, if we can prove nothing is mounted, direct
@@ -195,7 +199,7 @@ def _direct_usb_auto_permission(
         return True
 
     print(
-        f"NVMe SMART for {snapshot.controller_info.get('model') or device} requires temporary exclusive USB access.",
+        f"Direct NVMe access for {snapshot.controller_info.get('model') or device} requires temporary exclusive USB access.",
         file=sys.stderr,
     )
     if mounts:
@@ -205,7 +209,7 @@ def _direct_usb_auto_permission(
     else:
         print("Mounted-volume state could not be determined reliably.", file=sys.stderr)
     print(
-        "NVMe Doctor will temporarily unmount the disk if needed, read NVMe Identify/SMART, then restore it.",
+        "NVMe Doctor will temporarily unmount the disk if needed, read the underlying NVMe identity/health data, then restore it.",
         file=sys.stderr,
     )
     try:
@@ -242,7 +246,22 @@ def command_check(args: argparse.Namespace, output: Optional[str] = None) -> int
 
 def command_topology(args: argparse.Namespace) -> int:
     device = _device_or_error(args.device)
-    topology = collect_topology(device)
+    explicit_direct = bool(getattr(args, "direct_usb", False))
+    if explicit_direct and platform_key() != "darwin":
+        raise ValueError("--direct-usb is currently supported only on macOS with Realtek RTL9210 USB-NVMe bridges")
+
+    topology = collect_topology(device, direct_usb=explicit_direct)
+
+    if platform_key() == "darwin" and not explicit_direct:
+        from types import SimpleNamespace
+        ci = topology.get("controller_info") or {}
+        pseudo_snapshot = SimpleNamespace(
+            controller_info=ci,
+            capabilities={"nvme_smart": bool(ci.get("nvme_passthrough"))},
+        )
+        if _direct_usb_auto_permission(device, args, pseudo_snapshot):
+            topology = collect_topology(device, direct_usb=True)
+
     sys.stdout.write(render_topology_json(topology) if args.json else render_topology_text(topology))
     return EXIT_OK if topology.get("complete") else EXIT_INCOMPLETE
 

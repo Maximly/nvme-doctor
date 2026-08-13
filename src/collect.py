@@ -479,12 +479,14 @@ def collect_topology_linux(
     controller, device_path = normalize_device(requested_device)
     if not _is_native_linux_nvme(controller):
         block = sys_class_block / controller
+        bridge_candidate = _usb_solid_state_candidates_linux(sys_class_block).get(device_path, {})
         ci: Dict[str, Any] = {
             "state": "present" if block.exists() else "missing",
             "transport": "USB/SCSI -> NVMe",
             "native_nvme": False,
+            "usb_bridge_model": bridge_candidate.get("bridge_model"),
         }
-        probe = runner.run(["smartctl", "-i", "-j", device_path], timeout=10.0)
+        probe = runner.run(["smartctl", "-i", "-j", device_path], timeout=4.0)
         payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
         if _smartctl_json_is_nvme(payload):
             ident = _smartctl_identity(payload)
@@ -494,7 +496,12 @@ def collect_topology_linux(
                 "firmware_rev": ident.get("firmware"),
                 "nvme_version": ident.get("nvme_version"),
                 "protocol": "NVMe",
+                "identity_source": "smartctl",
             })
+        else:
+            ci["identity_source"] = "unavailable"
+            if probe.available and probe.returncode not in (0, None):
+                ci["identity_note"] = "underlying NVMe identity was not readable; rerun topology with sudo"
         ns: Dict[str, Any] = {"name": controller, "device": device_path}
         sectors = read_text(block / "size")
         logical = read_text(block / "queue" / "logical_block_size")
@@ -508,6 +515,11 @@ def collect_topology_linux(
                 ns["logical_block_size"] = int(logical)
         except ValueError:
             pass
+        notes = [
+            "The SSD is accessed through a USB/SCSI bridge. Its native NVMe PCIe endpoint, PCIe generation/link, AER and NUMA ancestry are hidden behind the bridge; the host USB/block path and underlying NVMe identity are shown when available."
+        ]
+        if ci.get("identity_note"):
+            notes.append(str(ci.get("identity_note")))
         return {
             "platform": "linux",
             "requested_device": requested_device,
@@ -521,9 +533,7 @@ def collect_topology_linux(
             "pci_path": [],
             "namespaces": [ns],
             "complete": False,
-            "notes": [
-                "This NVMe device is accessed through a USB/SCSI bridge. The bridge hides the SSD's native PCIe endpoint, PCIe generation/link, AER and NUMA ancestry; topology can only show the host block-device endpoint."
-            ],
+            "notes": notes,
         }
 
     controller_path = sys_class_nvme / controller
@@ -582,6 +592,7 @@ def collect_topology(
     sys_pci: Path = SYS_PCI,
     sys_class_block: Path = SYS_CLASS_BLOCK,
     platform_name: Optional[str] = None,
+    direct_usb: bool = False,
 ) -> Dict[str, Any]:
     key = platform_key(platform_name)
     if key == "linux":
@@ -590,25 +601,39 @@ def collect_topology(
             sys_pci=sys_pci, sys_class_block=sys_class_block
         )
     if key == "darwin":
-        from .collect_macos import discover_controllers_macos
-        from .util import normalize_macos_device
-        controller, device_path = normalize_macos_device(requested_device)
-        items = discover_controllers_macos(runner=runner)
-        item = next((x for x in items if x.get("device") == device_path), None) or {}
+        from .collect_macos import collect_snapshot_macos
+        snapshot = collect_snapshot_macos(
+            requested_device, runner=runner, kernel_lines=0, direct_usb=direct_usb
+        )
+        ci = dict(snapshot.controller_info)
+        bridge_model = ci.get("usb_bridge_model")
+        # Without direct access, diskutil's model is the enclosure-facing SCSI
+        # identity.  Do not mislabel it as the underlying NVMe model.
+        if ci.get("direct_usb") and not ci.get("nvme_passthrough"):
+            if bridge_model and ci.get("model") == bridge_model:
+                ci["model"] = None
+                ci["serial"] = None
+                ci["firmware_rev"] = None
         return {
             "platform": "darwin",
             "requested_device": requested_device,
-            "controller": controller,
-            "controller_device": device_path,
-            "controller_info": item,
+            "controller": snapshot.controller,
+            "controller_device": snapshot.device_path,
+            "controller_info": ci,
             "numa_node": None,
             "local_cpulist": None,
             "pci_domain": None,
             "pci_endpoint": {},
             "pci_path": [],
-            "namespaces": [{"name": controller, "device": device_path}],
+            "namespaces": [{
+                "name": snapshot.controller,
+                "device": snapshot.device_path,
+                "capacity_bytes": ci.get("tnvmcap") or ci.get("size_in_bytes"),
+            }],
             "complete": False,
-            "notes": ["macOS backend does not expose a supported NUMA/PCIe ancestry path; only the NVMe endpoint can be shown"],
+            "notes": [
+                "This SSD is accessed through a USB-to-NVMe bridge. macOS can show the USB/block endpoint, and RTL9210 direct mode can identify the underlying NVMe controller, but the SSD's native PCIe/NUMA/AER ancestry remains hidden behind USB."
+            ],
         }
     raise ValueError(f"unsupported operating system: {key}")
 
