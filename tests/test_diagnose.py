@@ -113,3 +113,29 @@ def test_usb3_bridge_at_480mbps_is_downshift_warning():
     report = diagnose(s)
     assert "usb-link-downshift" in codes(report)
     assert report.status == "WARNING"
+
+
+def test_clean_assessment_separates_health_risk_and_unknown_trend():
+    report = diagnose(snap())
+    assert report.assessment["verdict"] == "HEALTHY"
+    assert report.assessment["near_term_risk"]["state"] == "LOW"
+    assert report.assessment["trend"]["state"] == "UNKNOWN"
+
+
+def test_warning_transport_is_degraded_not_future_failure_claim():
+    s = snap()
+    s.pci = {"current_link_speed": "8.0 GT/s PCIe", "max_link_speed": "16.0 GT/s PCIe", "current_link_width": "4", "max_link_width": "4"}
+    report = diagnose(s)
+    assert report.status == "WARNING"
+    assert report.assessment["verdict"] == "DEGRADED"
+    assert report.assessment["near_term_risk"]["state"] == "ELEVATED"
+    assert report.assessment["trend"]["state"] == "UNKNOWN"
+
+
+def test_warning_media_is_at_risk():
+    s = snap()
+    s.smart["media_errors"] = 1
+    report = diagnose(s)
+    assert report.status == "WARNING"
+    assert report.assessment["verdict"] == "AT RISK"
+    assert report.assessment["near_term_risk"]["state"] == "ELEVATED"

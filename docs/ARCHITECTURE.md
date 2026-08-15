@@ -48,7 +48,7 @@ src/
 
 `tools/build_single.py` packages these modules into the root-level standalone `nvme-doctor` executable using a small in-memory importer. Relative imports and dynamic platform-specific imports continue to use the public `nvme_doctor` package name inside the bundled file.
 
-`install.sh` rebuilds this standalone file into a temporary location and installs only that executable. The installed command therefore does not depend on a companion Python package directory.
+`build.sh` invokes `tools/build_single.py` to rebuild the root-level standalone file. `install.sh` is intentionally build-free: it validates and copies the already-built root-level `nvme-doctor` into the selected prefix. The installed command therefore does not depend on a companion Python package directory.
 
 ## Platform contract
 

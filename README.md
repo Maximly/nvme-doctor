@@ -1,8 +1,8 @@
 # NVMe Doctor
 
-**NVMe SSD diagnostics and root-cause analysis for Linux and macOS.**
+**NVMe and SATA SSD/HDD diagnostics and root-cause analysis for Linux and macOS.**
 
-NVMe Doctor correlates standards-defined NVMe SMART/error data with the evidence the host OS can expose, then explains the strongest diagnosis supported by that evidence.
+NVMe Doctor correlates standards-defined NVMe or ATA/SATA SMART/error data with the evidence the host OS can expose, then explains the strongest diagnosis supported by that evidence.
 
 It is designed to answer a different question from `nvme-cli`, `smartctl`, `lspci`, or `system_profiler`:
 
@@ -12,7 +12,7 @@ NVMe Doctor is GPL-3.0-or-later software from KernelSoft.
 
 ## Status
 
-Version **1.0.9** is the consolidated public release.
+Version **1.1.8** improves SATA SSD health interpretation: explicit ATA reserved-space and media-wear SMART attributes are reported directly, while smartctl's synthesized ATA `spare_available` value is not treated as literal spare NAND remaining. Build/install remain separate.
 
 The repository contains both the maintainable flat source tree under `src/` and a pre-built standalone `nvme-doctor` executable. The standalone file contains all Python modules required by NVMe Doctor and can be copied directly to another Linux or macOS system with Python 3.9+.
 
@@ -38,11 +38,20 @@ sudo nvme-doctor check sdf
 sudo nvme-doctor check /dev/sdf
 ```
 
+SATA/ATA drives use the same commands:
+
+```bash
+sudo nvme-doctor check /dev/sda
+nvme-doctor topology /dev/sda
+```
+
+For SATA, NVMe Doctor reads `smartctl -j` ATA SMART/health data, including overall SMART status, reallocated/pending/offline-uncorrectable sectors, reported uncorrectable errors, command timeouts, UDMA CRC errors, temperature, power-on/cycle counters, ATA error log, self-test log, SATA revision, and negotiated/max interface speed when smartctl exposes them. USB-SATA bridges are supported through SAT when the OS/smartctl backend provides pass-through.
+
 When `/dev/sdX` is confirmed as NVMe, SMART/Health is valid, but native PCIe link generation, AER counters and NUMA locality are hidden by the bridge and are reported as unavailable rather than clean.
 
 ### macOS
 
-Native NVMe and external physical USB SSDs are discovered separately from SMART access. Native NVMe uses `system_profiler` plus `smartctl` when available. Synthesized APFS containers are excluded.
+Native NVMe, native SATA/ATA, and external physical USB storage are discovered separately from SMART access. Native NVMe uses `system_profiler` plus `smartctl` when available; SATA/ATA uses `diskutil` plus `smartctl`, and USB-SATA uses the SAT backend when available. Synthesized APFS containers are excluded.
 
 With Homebrew:
 
@@ -100,8 +109,10 @@ chmod +x ~/bin/nvme-doctor
 To rebuild it from the flat source tree:
 
 ```bash
-make build
+./build.sh
 ```
+
+`make build` is an equivalent development shortcut.
 
 To install system-wide:
 
@@ -109,7 +120,7 @@ To install system-wide:
 sudo ./install.sh install
 ```
 
-`install.sh` always rebuilds the standalone executable from `src/*.py` before installing it to `$PREFIX/bin/nvme-doctor` (default `/usr/local/bin/nvme-doctor`). Source modules are not required after installation.
+`build.sh` is the build step: it rebuilds the root-level standalone `nvme-doctor` from `src/*.py`. `install.sh` never builds; it only validates and installs that pre-built root-level executable to `$PREFIX/bin/nvme-doctor` (default `/usr/local/bin/nvme-doctor`).
 
 ## Platform capabilities
 
@@ -126,6 +137,9 @@ Linux exposes considerably more low-level PCIe/NVMe evidence than macOS. NVMe Do
 | ASPM/APST context | yes | not exposed by this backend |
 | Target-scoped OS logs | current-boot kernel log | only when a stable target identity can be matched |
 | USB-NVMe bridge health | via Linux SCSI/SNT pass-through when supported | RTL9210 direct USB backend; automatic when safely unmounted, interactive confirmation when mounted, explicit `--direct-usb` for non-interactive use |
+| SATA/ATA SMART | `smartctl` ATA JSON | `smartctl` ATA JSON |
+| USB-SATA bridge health | SAT pass-through via `smartctl` | SAT pass-through via `smartctl` when supported by Darwin/bridge |
+| SATA link speed/version | `smartctl` when exposed | `smartctl` when exposed |
 
 A macOS report therefore includes a `CAPABILITIES` section such as:
 
@@ -198,6 +212,21 @@ Where the OS/tooling exposes the relevant NVMe SMART/Health log:
 - lifetime data read/written and host command counts;
 - controller busy time and temperature/thermal-management history;
 - NVMe error-information log count.
+
+### SATA / ATA health
+
+For SATA SSDs and HDDs, NVMe Doctor diagnoses high-signal ATA SMART evidence rather than treating every vendor-specific attribute as universal:
+
+- ATA SMART overall-health result and threshold failures;
+- reallocated, pending and offline-uncorrectable sectors;
+- reported uncorrectable errors and command timeouts;
+- UDMA CRC errors as transport/cable evidence;
+- temperature, power-on hours and power cycles;
+- ATA SMART error log and self-test log when available;
+- SATA revision plus current/max interface speed when exposed by smartctl;
+- USB-SATA SAT bridge access where supported.
+
+The complete smartctl JSON is retained in reports so vendor-specific attributes remain available for expert inspection without being over-interpreted by generic rules.
 
 ### Linux-specific evidence
 
@@ -323,7 +352,9 @@ NVMe Doctor intentionally does not bundle or auto-install Homebrew or smartmonto
 
 ```text
 DOCTOR'S ASSESSMENT
-  Verdict              HEALTHY NOW
+  Verdict              HEALTHY
+  Near-term risk       LOW — no warning/critical health signal was detected in this check
+  Trend                UNKNOWN — no historical comparison was supplied to this check
   Media / integrity    CLEAN — no SMART critical warning or media errors
   PCIe / controller    CLEAN — Gen5 x4 at endpoint maximum; no reset/timeout evidence
   Thermal              NORMAL — 46°C
@@ -413,7 +444,13 @@ Examples:
 
 ## Optional system-wide installation
 
-Installation is not required. If you want `nvme-doctor` in `/usr/local/bin`:
+Installation is not required. Release archives already contain a pre-built `nvme-doctor`. If you changed source code, build first:
+
+```bash
+./build.sh
+```
+
+Then install the existing artifact:
 
 ```bash
 sudo ./install.sh install
@@ -458,3 +495,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Diagnostic rules should be evidence-base
 ## License
 
 GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
+
+### Quick health in `list`
+
+`nvme-doctor list` includes a non-disruptive `Health` column (`GOOD`, `WARN`, `FAIL`, or `-`). A dash means a trustworthy status is not cheaply available without a deeper/disruptive probe; notably, macOS USB enclosures that require direct capture remain `-` until `check` is run.

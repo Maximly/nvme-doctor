@@ -100,6 +100,127 @@ def to_int(value: Any) -> Optional[int]:
         return None
 
 
+
+def smartctl_percent(value: Any) -> Optional[int]:
+    """Normalize smartctl percentage values that may be scalars or JSON objects.
+
+    Some ATA SSD vendors expose fields such as ``spare_available`` and
+    ``endurance_used`` as ``{"current_percent": N}`` instead of a scalar.
+    Keep this strict rather than relying on ``to_int(dict)`` string parsing.
+    """
+    if isinstance(value, dict):
+        for key in ("current_percent", "percent", "value"):
+            if key in value:
+                return to_int(value.get(key))
+        return None
+    return to_int(value)
+
+
+def ata_smart_attributes(payload: Any) -> list[Dict[str, Any]]:
+    """Return ATA SMART attribute rows from a smartctl JSON payload."""
+    if not isinstance(payload, dict):
+        return []
+    attrs = payload.get("ata_smart_attributes")
+    table = attrs.get("table") if isinstance(attrs, dict) else None
+    return [row for row in table if isinstance(row, dict)] if isinstance(table, list) else []
+
+
+def _ata_attr_raw_value(row: Dict[str, Any]) -> Optional[int]:
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        return to_int(raw.get("value"))
+    return to_int(raw)
+
+
+def ata_reserved_space_indicator(payload: Any) -> Optional[Dict[str, Any]]:
+    """Find an explicit ATA reserved/spare-space SMART attribute.
+
+    smartctl may synthesize top-level ``spare_available`` from unrelated
+    normalized attributes (notably SMART 5 Reallocated_Sector_Ct).  That is
+    not safe to interpret as a literal spare-NAND percentage.  Prefer only
+    attributes whose *name itself* explicitly describes available reserved
+    or spare space.
+    """
+    candidates = []
+    for row in ata_smart_attributes(payload):
+        name = str(row.get("name") or "").strip()
+        norm = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        explicit = (
+            ("available" in norm and ("reserv" in norm or "spare" in norm))
+            or ("remaining" in norm and "spare" in norm)
+            or ("spare" in norm and "block" in norm)
+        )
+        if not explicit or "realloc" in norm or "retir" in norm:
+            continue
+        value = to_int(row.get("value"))
+        if value is None:
+            continue
+        attr_id = to_int(row.get("id"))
+        # Prefer well-known explicit reserve IDs when several aliases exist.
+        priority = 0 if attr_id in {170, 232} else 1
+        candidates.append((priority, attr_id if attr_id is not None else 9999, row))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    row = candidates[0][2]
+    value = to_int(row.get("value"))
+    threshold = to_int(row.get("thresh"))
+    result: Dict[str, Any] = {
+        "value": value,
+        "threshold": threshold,
+        "worst": to_int(row.get("worst")),
+        "raw": _ata_attr_raw_value(row),
+        "attribute_id": to_int(row.get("id")),
+        "attribute_name": row.get("name"),
+    }
+    if value is not None and threshold is not None:
+        result["margin"] = value - threshold
+    # Preserve duplicate/alias sources for expert JSON output.
+    sources = []
+    for _, _, src in candidates:
+        sources.append({
+            "id": to_int(src.get("id")),
+            "name": src.get("name"),
+            "value": to_int(src.get("value")),
+            "worst": to_int(src.get("worst")),
+            "threshold": to_int(src.get("thresh")),
+            "raw": _ata_attr_raw_value(src),
+        })
+    result["sources"] = sources
+    return result
+
+
+def ata_media_wear_indicator(payload: Any) -> Optional[Dict[str, Any]]:
+    """Return an explicit normalized ATA media-wear/life indicator.
+
+    The number remains vendor-defined, so expose it as a normalized indicator
+    rather than converting it to a generic ``percent used`` value.
+    """
+    candidates = []
+    for row in ata_smart_attributes(payload):
+        name = str(row.get("name") or "").strip()
+        norm = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        if not any(token in norm for token in ("wearout_indicator", "media_wear", "wear_indicator", "life_left", "remaining_life")):
+            continue
+        value = to_int(row.get("value"))
+        if value is None:
+            continue
+        attr_id = to_int(row.get("id"))
+        priority = 0 if attr_id in {233, 231} else 1
+        candidates.append((priority, attr_id if attr_id is not None else 9999, row))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    row = candidates[0][2]
+    return {
+        "value": to_int(row.get("value")),
+        "threshold": to_int(row.get("thresh")),
+        "worst": to_int(row.get("worst")),
+        "raw": _ata_attr_raw_value(row),
+        "attribute_id": to_int(row.get("id")),
+        "attribute_name": row.get("name"),
+    }
+
 def first(mapping: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in mapping:

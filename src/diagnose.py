@@ -55,6 +55,9 @@ def _kernel_flags(lines: Iterable[str]) -> Dict[str, Any]:
         "usb_disconnect": re.compile(r"(?:usb .*disconnect|USB disconnect|device descriptor read|device not accepting address|cannot enable)", re.I),
         "uas_error": re.compile(r"(?:uas_eh_abort_handler|uas_eh_device_reset_handler|uas.*(?:abort|reset|failed|error))", re.I),
         "scsi_io": re.compile(r"(?:I/O error, dev sd[a-z]+|blk_update_request.*sd[a-z]+|Buffer I/O error.*sd[a-z]+)", re.I),
+        "ata_reset": re.compile(r"(?:ata\d+:.*(?:hard resetting link|softreset failed|reset failed)|SATA link down)", re.I),
+        "ata_error": re.compile(r"(?:ata\d+:.*(?:failed command|exception Emask|SError|status: \{)|end_request: I/O error.*sd[a-z]+)", re.I),
+        "ata_link": re.compile(r"(?:ata\d+: SATA link (?:up|down)|SATA link speed|limiting SATA link speed)", re.I),
     }
     out: Dict[str, Any] = {key: [] for key in patterns}
     for line in lines:
@@ -97,25 +100,176 @@ def _finding_severity(findings: List[Finding], codes: set[str]) -> Optional[str]
     return None
 
 
+_MEDIA_RISK_CODES = {
+    "nvme-critical-warning",
+    "available-spare",
+    "media-errors",
+    "endurance-near-limit",
+    "endurance-used",
+    "ata-smart-failed",
+    "ata-threshold-failure",
+    "ata-unstable-sectors",
+    "ata-reallocated-sectors",
+    "ata-reported-uncorrectable",
+    "ata-reserve-low",
+    "ata-reserve-margin-low",
+}
+
+
+def _assessment_summary(findings: List[Finding], status: str, protocol: str) -> Dict[str, Any]:
+    """Separate current health from future-risk/trend language.
+
+    A single snapshot can establish current faults and risk signals, but it cannot
+    establish a trend.  Trend therefore remains UNKNOWN unless a future caller
+    explicitly supplies comparison evidence.
+    """
+    warning_media = any(f.severity == "warning" and f.code in _MEDIA_RISK_CODES for f in findings)
+
+    if status == "CRITICAL":
+        verdict = "CRITICAL"
+        risk_state = "HIGH"
+        risk_detail = "Serious current failure/reliability evidence is present."
+    elif status == "WARNING":
+        if warning_media:
+            verdict = "AT RISK"
+            risk_state = "ELEVATED"
+            risk_detail = "Current media/endurance evidence warrants attention; this is not a time-to-failure prediction."
+        else:
+            verdict = "DEGRADED"
+            risk_state = "ELEVATED"
+            risk_detail = "A current transport, controller, link, or thermal problem is present; this is not a time-to-failure prediction."
+    elif status == "INCOMPLETE":
+        verdict = "INCOMPLETE"
+        risk_state = "UNKNOWN"
+        risk_detail = "Primary health evidence is incomplete, so near-term risk cannot be assessed reliably."
+    else:
+        verdict = "HEALTHY"
+        risk_state = "LOW"
+        risk_detail = "No warning/critical health signal was detected in the evidence collected by this check."
+
+    if status == "OK":
+        headline = f"No material current {protocol} health fault was detected in the available evidence."
+    elif status == "INCOMPLETE":
+        headline = f"There is not enough {protocol} health evidence to issue a clean verdict."
+    elif verdict == "AT RISK":
+        headline = f"Current {protocol} media/endurance evidence indicates elevated risk and needs investigation."
+    elif verdict == "DEGRADED":
+        headline = f"The {protocol} drive or storage path has a current degraded condition that needs investigation."
+    else:
+        headline = f"Active evidence indicates a serious {protocol} storage problem."
+
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "near_term_risk": {"state": risk_state, "detail": risk_detail},
+        "trend": {
+            "state": "UNKNOWN",
+            "detail": "No historical comparison was supplied to this check; save a baseline and use `nvme-doctor diff` to establish direction of change.",
+        },
+    }
+
+
+
+def _build_ata_assessment(snapshot: Snapshot, findings: List[Finding], status: str) -> Dict[str, Any]:
+    smart = snapshot.smart or {}
+    rows: List[Dict[str, str]] = []
+    summary = _assessment_summary(findings, status, "ATA/SATA")
+    verdict = summary["verdict"]
+    headline = summary["headline"]
+
+    media_codes = {"ata-smart-failed", "ata-threshold-failure", "ata-unstable-sectors", "ata-reallocated-sectors", "ata-reported-uncorrectable"}
+    media_sev = _finding_severity(findings, media_codes)
+    if media_sev in {"critical", "warning"}:
+        detail = "; ".join(f.title for f in findings if f.code in media_codes and f.severity in {"critical", "warning"})
+        rows.append({"label": "Media / integrity", "state": "PROBLEM", "detail": detail})
+    elif smart:
+        rows.append({"label": "Media / integrity", "state": "CLEAN", "detail": f"SMART overall-health {'passed' if smart.get('smart_passed') is not False else 'failed'}; pending={_smart_int(smart, 'current_pending_sectors') or 0}, offline-uncorrectable={_smart_int(smart, 'offline_uncorrectable') or 0}"})
+    else:
+        rows.append({"label": "Media / integrity", "state": "UNKNOWN", "detail": "ATA SMART data was not collected"})
+
+    reserve = _smart_int(smart, "reserved_space")
+    reserve_threshold = _smart_int(smart, "reserved_space_threshold")
+    reserve_margin = _smart_int(smart, "reserved_space_margin")
+    wear = _smart_int(smart, "media_wear_indicator")
+    if reserve is not None:
+        detail_parts = [f"reserved-space indicator {reserve}/100" if 0 <= reserve <= 100 else f"reserved-space indicator {reserve}"]
+        if reserve_threshold is not None:
+            detail_parts.append(f"threshold {reserve_threshold}/100" if 0 <= reserve_threshold <= 100 else f"threshold {reserve_threshold}")
+        if reserve_margin is not None:
+            detail_parts.append(f"margin {reserve_margin:+d}")
+        if wear is not None:
+            detail_parts.append(f"media-wear indicator {wear}/100" if 0 <= wear <= 100 else f"media-wear indicator {wear}")
+        reserve_sev = _finding_severity(findings, {"ata-reserve-low", "ata-reserve-margin-low"})
+        rows.append({"label": "Flash reserve", "state": "PROBLEM" if reserve_sev in {"critical", "warning"} else "HEALTHY", "detail": "; ".join(detail_parts)})
+
+    usb_path = snapshot.controller_info.get("usb_path")
+    if isinstance(usb_path, dict) and usb_path.get("usb_port"):
+        usb_codes = {"usb-transport-instability", "usb-link-downshift"}
+        usb_sev = _finding_severity(findings, usb_codes)
+        usb = usb_path or {}
+        if usb_sev in {"critical", "warning"}:
+            rows.append({"label": "USB transport", "state": "PROBLEM", "detail": "; ".join(f.title for f in findings if f.code in usb_codes and f.severity in {"critical", "warning"})})
+        else:
+            bits = [str(x) for x in (usb.get("usb_port"), f"{usb.get('speed_mbps')} Mb/s" if usb.get("speed_mbps") is not None else None, usb.get("interface_driver")) if x]
+            rows.append({"label": "USB transport", "state": "CLEAN", "detail": "; ".join(bits) or "USB bridge path identified"})
+    else:
+        iface = snapshot.controller_info.get("interface_speed")
+        sata = snapshot.controller_info.get("sata_version")
+        details = []
+        if isinstance(iface, dict):
+            for key in ("current", "max"):
+                val = iface.get(key)
+                if isinstance(val, dict):
+                    val = val.get("string")
+                if val:
+                    details.append(f"{key}={val}")
+        if isinstance(sata, dict) and sata.get("string"):
+            details.append(str(sata.get("string")))
+        rows.append({"label": "SATA transport", "state": "KNOWN" if details else "UNKNOWN", "detail": "; ".join(details) if details else "SATA link details unavailable"})
+
+    temp = parse_temperature_c(smart.get("temperature"))
+    thermal_sev = _finding_severity(findings, {"temperature-critical", "temperature-warning"})
+    if thermal_sev in {"critical", "warning"}:
+        rows.append({"label": "Thermal", "state": "PROBLEM", "detail": next(f.summary for f in findings if f.code in {"temperature-critical", "temperature-warning"})})
+    elif temp is not None:
+        rows.append({"label": "Thermal", "state": "NORMAL", "detail": f"{temp}°C"})
+
+    crc = _smart_int(smart, "udma_crc_errors") or 0
+    timeouts = _smart_int(smart, "command_timeouts") or 0
+    if crc or timeouts:
+        rows.append({"label": "Interface history", "state": "REVIEW", "detail": f"CRC errors={crc}; command timeouts={timeouts}"})
+
+    if status == "OK":
+        recommendation = "No immediate action is indicated. Save a JSON report as a baseline and compare counters if symptoms appear."
+    elif status == "INCOMPLETE":
+        if isinstance(usb_path, dict) and usb_path.get("usb_port"):
+            recommendation = "Restore ATA SMART access through the correct SAT/USB bridge backend before trusting a clean result."
+        else:
+            recommendation = "Restore ATA SMART access through the native libata/ATA backend before trusting a clean result."
+    else:
+        actionable = [f.actions[0] for f in findings if f.severity in {"critical", "warning"} and f.actions]
+        recommendation = actionable[0] if actionable else "Review the warning/critical findings before stressing or modifying the drive."
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "near_term_risk": summary["near_term_risk"],
+        "trend": summary["trend"],
+        "domains": rows,
+        "recommendation": recommendation,
+    }
+
 def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) -> Dict[str, Any]:
     """Build a concise doctor-style interpretation from the collected evidence."""
+    if _is_ata_snapshot(snapshot):
+        return _build_ata_assessment(snapshot, findings, status)
     smart = snapshot.smart or {}
     pci = snapshot.pci or {}
     kernel = _kernel_flags(snapshot.kernel_lines) if snapshot.capabilities.get("targeted_kernel_log", True) else _kernel_flags([])
     rows: List[Dict[str, str]] = []
 
-    if status == "CRITICAL":
-        verdict = "CRITICAL"
-        headline = "Active evidence indicates a serious NVMe/storage-path problem."
-    elif status == "WARNING":
-        verdict = "ATTENTION"
-        headline = "The drive or its PCIe path has evidence that needs investigation."
-    elif status == "INCOMPLETE":
-        verdict = "INCOMPLETE"
-        headline = "There is not enough health evidence to issue a clean verdict."
-    else:
-        verdict = "HEALTHY NOW"
-        headline = "No active fault was detected in the available NVMe health evidence."
+    summary = _assessment_summary(findings, status, "NVMe")
+    verdict = summary["verdict"]
+    headline = summary["headline"]
 
     # Media / integrity
     media_sev = _finding_severity(findings, {"nvme-critical-warning", "available-spare", "media-errors"})
@@ -301,9 +455,189 @@ def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) 
         actionable = [f.actions[0] for f in findings if f.severity in {"critical", "warning"} and f.actions]
         recommendation = actionable[0] if actionable else "Review the warning/critical findings below before stressing or modifying the drive."
 
-    return {"verdict": verdict, "headline": headline, "domains": rows, "recommendation": recommendation}
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "near_term_risk": summary["near_term_risk"],
+        "trend": summary["trend"],
+        "domains": rows,
+        "recommendation": recommendation,
+    }
+
+
+
+def _is_ata_snapshot(snapshot: Snapshot) -> bool:
+    protocol = str(snapshot.controller_info.get("protocol") or "").strip().lower()
+    return protocol in {"ata", "sata"} or bool(snapshot.capabilities.get("ata_smart"))
+
+
+def _diagnose_ata(snapshot: Snapshot) -> Report:
+    findings: List[Finding] = []
+    smart = snapshot.smart or {}
+    kernel = _kernel_flags(snapshot.kernel_lines) if snapshot.capabilities.get("targeted_kernel_log", True) else _kernel_flags([])
+    state = str(snapshot.controller_info.get("state", "")).strip().lower()
+
+    if state and state not in {"live", "new", "connecting", "present"}:
+        severity = "critical" if state in {"missing", "dead", "deleting"} else "warning"
+        findings.append(Finding(
+            "device-state", severity, "Storage device is not fully live", f"Device state is {state!r}.",
+            "high", [f"device state={state}"], ["Inspect host/storage logs and physical connectivity before attempting destructive operations."],
+        ))
+
+    usb = snapshot.controller_info.get("usb_path") if isinstance(snapshot.controller_info.get("usb_path"), dict) else {}
+    if usb:
+        usb_events = kernel.get("usb_disconnect", []) + kernel.get("uas_error", []) + kernel.get("usb_reset", []) + kernel.get("scsi_io", [])
+        if usb_events:
+            findings.append(Finding(
+                "usb-transport-instability", "warning", "USB storage transport shows reset/disconnect evidence",
+                "Target-correlated USB/UAS/SCSI events indicate transport instability independent of the ATA media-health counters.",
+                "high" if len(usb_events) >= 2 else "medium",
+                ([f"usb_port={usb.get('usb_port')}"] if usb.get("usb_port") else []) + usb_events[-6:],
+                ["Retest with a known-good short cable on a direct host port and bypass hubs/docks."],
+            ))
+        speed = usb.get("speed_mbps")
+        version = str(usb.get("usb_version") or "").strip()
+        try:
+            speed_num = float(speed) if speed is not None else None
+            version_num = float(version) if version else None
+        except (TypeError, ValueError):
+            speed_num = version_num = None
+        if version_num is not None and version_num >= 3.0 and speed_num is not None and speed_num <= 480:
+            findings.append(Finding(
+                "usb-link-downshift", "warning", "USB 3.x bridge is operating at USB 2.0 speed",
+                f"The bridge reports USB {version} capability but the current link speed is only {speed_num:g} Mb/s.",
+                "high", [f"usb_version={version}", f"speed_mbps={speed_num:g}"],
+                ["Replace/reseat the cable and bypass hubs/docks, then verify SuperSpeed negotiation."],
+            ))
+
+    passed = smart.get("smart_passed")
+    if passed is False:
+        findings.append(Finding(
+            "ata-smart-failed", "critical", "ATA SMART overall-health test failed",
+            "The drive's ATA SMART RETURN STATUS indicates a failing health condition.", "high",
+            ["smart_status.passed=false"], ["Back up important data immediately and plan drive replacement."],
+        ))
+
+    failed_attrs = smart.get("failed_attributes") if isinstance(smart.get("failed_attributes"), list) else []
+    if failed_attrs:
+        evidence = []
+        for row in failed_attrs[:6]:
+            if isinstance(row, dict):
+                evidence.append(f"SMART {row.get('id')} {row.get('name')}: value={row.get('value')} thresh={row.get('thresh')} when_failed={row.get('when_failed')}")
+        findings.append(Finding(
+            "ata-threshold-failure", "critical", "One or more ATA SMART attributes crossed failure thresholds",
+            f"{len(failed_attrs)} SMART attribute(s) report a threshold failure.", "high", evidence,
+            ["Back up data and inspect the failing attributes before further stress testing."],
+        ))
+
+    realloc = _smart_int(smart, "reallocated_sectors") or 0
+    pending = _smart_int(smart, "current_pending_sectors") or 0
+    offline = _smart_int(smart, "offline_uncorrectable") or 0
+    reported = _smart_int(smart, "reported_uncorrectable") or 0
+    if pending > 0 or offline > 0:
+        findings.append(Finding(
+            "ata-unstable-sectors", "critical", "Unstable or uncorrectable SATA sectors are present",
+            f"SMART reports pending={pending} and offline_uncorrectable={offline} sector(s).", "high",
+            [f"current_pending_sectors={pending}", f"offline_uncorrectable={offline}"],
+            ["Back up readable data before running write-based remediation or destructive surface tests."],
+        ))
+    if realloc > 0:
+        findings.append(Finding(
+            "ata-reallocated-sectors", "warning", "Reallocated SATA sectors have been recorded",
+            f"SMART reports {realloc} reallocated sector(s).", "high", [f"reallocated_sectors={realloc}"],
+            ["Track whether the count grows; growth together with pending/uncorrectable sectors is strong replacement evidence."],
+        ))
+    if reported > 0:
+        findings.append(Finding(
+            "ata-reported-uncorrectable", "warning", "Reported uncorrectable ATA errors are present",
+            f"SMART reports {reported} reported uncorrectable command error(s).", "high", [f"reported_uncorrectable={reported}"],
+            ["Correlate with OS I/O errors and back up data if these are recent or increasing."],
+        ))
+
+    crc = _smart_int(smart, "udma_crc_errors") or 0
+    if crc > 0:
+        findings.append(Finding(
+            "ata-crc-errors", "warning" if crc >= 10 else "info", "SATA interface CRC errors have been recorded",
+            f"SMART UDMA CRC Error Count is {crc}. This is usually a link/cable/backplane signal rather than a media-sector counter.",
+            "high", [f"udma_crc_errors={crc}"],
+            ["Reseat/replace the SATA cable or USB-SATA path and compare whether the counter stops increasing."],
+        ))
+
+    timeouts = _smart_int(smart, "command_timeouts") or 0
+    if timeouts > 0:
+        findings.append(Finding(
+            "ata-command-timeouts", "warning", "ATA command timeouts have been recorded",
+            f"SMART Command Timeout raw count is {timeouts}.", "medium", [f"command_timeouts={timeouts}"],
+            ["Correlate with host resets, power events, cable/backplane errors and workload timing."],
+        ))
+
+    ata_errors = _smart_int(smart, "ata_error_count") or 0
+    if ata_errors > 0:
+        findings.append(Finding(
+            "ata-error-log", "info", "ATA error log contains historical entries",
+            f"The ATA SMART error log reports {ata_errors} error entr{'y' if ata_errors == 1 else 'ies'}.", "medium",
+            [f"ata_error_count={ata_errors}"], ["Inspect the ATA error log and correlate entries with current counters and OS I/O errors."],
+        ))
+
+    reserve = _smart_int(smart, "reserved_space")
+    reserve_threshold = _smart_int(smart, "reserved_space_threshold")
+    reserve_margin = _smart_int(smart, "reserved_space_margin")
+    if reserve is not None and reserve_threshold is not None:
+        if reserve <= reserve_threshold:
+            findings.append(Finding(
+                "ata-reserve-low", "critical", "SSD reserved-space indicator reached its failure threshold",
+                f"The explicit ATA reserved-space SMART attribute is {reserve} with a threshold of {reserve_threshold}.",
+                "high", [f"reserved_space={reserve}", f"reserved_space_threshold={reserve_threshold}"],
+                ["Back up important data and inspect the vendor SMART attributes; reserve exhaustion is replacement evidence."],
+            ))
+        elif reserve_margin is not None and reserve_margin <= 10:
+            findings.append(Finding(
+                "ata-reserve-margin-low", "warning", "SSD reserved-space margin is low",
+                f"The explicit ATA reserved-space SMART attribute is {reserve}, only {reserve_margin} normalized point(s) above its threshold of {reserve_threshold}.",
+                "high", [f"reserved_space={reserve}", f"reserved_space_threshold={reserve_threshold}", f"reserved_space_margin={reserve_margin}"],
+                ["Track this attribute over time and plan replacement if the reserve indicator continues to fall."],
+            ))
+
+    temp = parse_temperature_c(smart.get("temperature"))
+    if temp is not None:
+        if temp >= 65:
+            findings.append(Finding("temperature-critical", "critical", "Drive temperature is critical", f"Drive temperature is {temp}°C.", "high", [f"temperature={temp}°C"], ["Reduce load and improve cooling before further stress testing."]))
+        elif temp >= 55:
+            findings.append(Finding("temperature-warning", "warning", "Drive temperature is high", f"Drive temperature is {temp}°C.", "high", [f"temperature={temp}°C"], ["Check airflow, enclosure cooling and workload temperature behavior."]))
+
+    ata_resets = kernel.get("ata_reset", [])
+    ata_errors = kernel.get("ata_error", [])
+    if ata_resets or ata_errors:
+        findings.append(Finding(
+            "ata-host-link-errors", "warning", "Host reports SATA link reset/error activity",
+            f"Target-scoped host logs contain {len(ata_resets)} SATA reset event(s) and {len(ata_errors)} ATA error event(s).",
+            "high", (ata_errors + ata_resets)[-6:],
+            ["Correlate these events with CRC/timeout counters, then inspect the SATA cable/backplane/power path before blaming media."],
+        ))
+
+    scsi_io = kernel.get("scsi_io", [])
+    if scsi_io and not (pending or offline or reported):
+        findings.append(Finding(
+            "host-io-errors", "warning", "Host reports block I/O errors without matching ATA media counters",
+            "Target-scoped host logs contain block I/O errors while the strongest ATA media counters are currently clear, increasing suspicion of transport/power/controller issues.",
+            "medium", scsi_io[-4:], ["Inspect SATA/USB cabling, power and controller resets; compare whether SMART counters increase at the same time."],
+        ))
+
+    findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.code))
+    if any(f.severity == "critical" for f in findings):
+        status = "CRITICAL"
+    elif any(f.severity == "warning" for f in findings):
+        status = "WARNING"
+    elif not snapshot.capabilities.get("ata_smart") or not snapshot.smart:
+        status = "INCOMPLETE"
+    else:
+        status = "OK"
+    return Report(snapshot, findings, status, _build_assessment(snapshot, findings, status))
 
 def diagnose(snapshot: Snapshot) -> Report:
+    if _is_ata_snapshot(snapshot):
+        return _diagnose_ata(snapshot)
+
     findings: List[Finding] = []
     smart = snapshot.smart or {}
     pci = snapshot.pci or {}

@@ -91,8 +91,9 @@ def test_parse_smartctl_scan_keeps_usb_nvme_bridge_type():
         "/dev/disk5 -d sat # /dev/disk5, ATA device\n"
     )
     assert items == [
-        {"device": "/dev/disk0", "smartctl_type": "nvme", "scan_line": "/dev/disk0 -d nvme # /dev/disk0, NVMe device"},
-        {"device": "/dev/disk4", "smartctl_type": "sntrealtek", "scan_line": "/dev/disk4 -d sntrealtek # /dev/disk4 [USB NVMe Realtek], NVMe device"},
+        {"device": "/dev/disk0", "smartctl_type": "nvme", "protocol_hint": "NVMe", "scan_line": "/dev/disk0 -d nvme # /dev/disk0, NVMe device"},
+        {"device": "/dev/disk4", "smartctl_type": "sntrealtek", "protocol_hint": "NVMe", "scan_line": "/dev/disk4 -d sntrealtek # /dev/disk4 [USB NVMe Realtek], NVMe device"},
+        {"device": "/dev/disk5", "smartctl_type": "sat", "protocol_hint": "ATA", "scan_line": "/dev/disk5 -d sat # /dev/disk5, ATA device"},
     ]
 
 
@@ -289,6 +290,7 @@ def test_snt_scan_line_does_not_need_nvme_word_and_normalizes_rdisk():
         "device": "/dev/disk4",
         "smartctl_device": "/dev/rdisk4",
         "smartctl_type": "sntjmicron",
+        "protocol_hint": "NVMe",
         "scan_line": "/dev/rdisk4 -d sntjmicron # USB bridge",
     }]
 

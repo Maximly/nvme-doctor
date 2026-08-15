@@ -50,3 +50,32 @@ def test_nvme_nonzero_is_failure_even_with_text_output():
     notes = []
     assert _read_tool_json(runner, ["nvme", "smart-log", "/dev/nvme0", "-o", "json"], notes) is None
     assert notes and notes[0].startswith("nvme smart-log failed:")
+
+
+def test_linux_native_nvme_list_size_sums_visible_namespaces(tmp_path):
+    from src.collect import discover_controllers_linux
+
+    nvme = tmp_path / "nvme"
+    block = tmp_path / "block"
+    ctrl = nvme / "nvme0"
+    ctrl.mkdir(parents=True)
+    (ctrl / "model").write_text("TEST NVME\n")
+    (ctrl / "serial").write_text("SER\n")
+    (ctrl / "firmware_rev").write_text("FW\n")
+    (ctrl / "state").write_text("live\n")
+    (ctrl / "transport").write_text("pcie\n")
+    ns1 = block / "nvme0n1"
+    ns1.mkdir(parents=True)
+    (ns1 / "size").write_text("2000000\n")
+    ns2 = block / "nvme0n2"
+    ns2.mkdir(parents=True)
+    (ns2 / "size").write_text("1000000\n")
+
+    class NoTools:
+        def run(self, *args, **kwargs):
+            from src.runner import CommandResult
+            return CommandResult(argv=list(args[0]), returncode=127, stdout="", stderr="", available=False)
+
+    rows = discover_controllers_linux(sys_class_nvme=nvme, sys_class_block=block, runner=NoTools())
+    row = next(x for x in rows if x["controller"] == "nvme0")
+    assert row["size_bytes"] == 3_000_000 * 512

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvme-doctor"
-version = "1.0.13"
-description = "NVMe SSD diagnostics and root-cause analyzer for Linux and macOS"
+version = "1.1.12"
+description = "NVMe and SATA drive diagnostics and root-cause analyzer for Linux and macOS"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "GPL-3.0-or-later"}
@@ -13,7 +13,7 @@ authors = [
   {name = "KernelSoft"}
 ]
 keywords = [
-  "nvme", "ssd", "linux", "macos", "diagnostics", "pcie", "smart", "aer", "storage"
+  "nvme", "sata", "ata", "ssd", "hdd", "linux", "macos", "diagnostics", "pcie", "smart", "aer", "storage"
 ]
 classifiers = [
   "Development Status :: 5 - Production/Stable",

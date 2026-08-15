@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .model import Snapshot
 from .runner import Runner
-from .util import normalize_device, parse_counter_blob, read_json, read_text
+from .util import normalize_device, parse_counter_blob, read_json, read_text, ata_media_wear_indicator, ata_reserved_space_indicator, smartctl_percent, to_int
 from .platforms import platform_key
 
 
@@ -32,13 +32,26 @@ def _os_release() -> Dict[str, str]:
     return data
 
 
-def _discover_native_controllers_linux(sys_class_nvme: Path = SYS_CLASS_NVME) -> List[Dict[str, Any]]:
+def _discover_native_controllers_linux(
+    sys_class_nvme: Path = SYS_CLASS_NVME,
+    sys_class_block: Path = SYS_CLASS_BLOCK,
+) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     if not sys_class_nvme.exists():
         return result
     for path in sorted(sys_class_nvme.glob("nvme[0-9]*")):
         if not re.fullmatch(r"nvme\d+", path.name):
             continue
+        total_size = 0
+        have_size = False
+        if sys_class_block.exists():
+            for ns in sorted(sys_class_block.glob(f"{path.name}n*")):
+                if not re.fullmatch(rf"{re.escape(path.name)}n\d+", ns.name):
+                    continue
+                sectors = to_int(read_text(ns / "size"))
+                if sectors is not None and sectors >= 0:
+                    total_size += sectors * 512
+                    have_size = True
         info = {
             "controller": path.name,
             "device": f"/dev/{path.name}",
@@ -49,10 +62,150 @@ def _discover_native_controllers_linux(sys_class_nvme: Path = SYS_CLASS_NVME) ->
             "transport": read_text(path / "transport") or "PCIe/NVMe",
             "address": read_text(path / "address"),
             "native_nvme": True,
+            "protocol": "NVMe",
+            "size_bytes": total_size if have_size else None,
         }
         result.append(info)
     return result
 
+
+
+
+def _smartctl_json_protocol(payload: Any) -> Optional[str]:
+    """Classify a smartctl JSON payload as NVMe, ATA/SATA, or unknown."""
+    if not isinstance(payload, dict):
+        return None
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    protocol = str(device.get("protocol") or "").strip().lower()
+    dev_type = str(device.get("type") or "").strip().lower()
+    if (
+        protocol == "nvme"
+        or "nvme" in dev_type
+        or payload.get("nvme_version") is not None
+        or isinstance(payload.get("nvme_smart_health_information_log"), dict)
+    ):
+        return "NVMe"
+    ata_evidence = (
+        protocol in {"ata", "sata"}
+        or payload.get("sata_version") is not None
+        or isinstance(payload.get("ata_smart_attributes"), dict)
+        or isinstance(payload.get("ata_smart_data"), dict)
+    )
+    if ata_evidence or ((dev_type == "ata" or dev_type.startswith("sat")) and protocol not in {"scsi", "sas"}):
+        return "ATA"
+    return None
+
+
+def _smartctl_json_is_ata(payload: Any) -> bool:
+    return _smartctl_json_protocol(payload) == "ATA"
+
+
+def _ata_attr_raw(payload: Dict[str, Any], attr_id: int) -> Optional[int]:
+    attrs = payload.get("ata_smart_attributes")
+    table = attrs.get("table") if isinstance(attrs, dict) else None
+    if not isinstance(table, list):
+        return None
+    for row in table:
+        if not isinstance(row, dict) or to_int(row.get("id")) != attr_id:
+            continue
+        raw = row.get("raw")
+        if isinstance(raw, dict):
+            value = to_int(raw.get("value"))
+            if value is not None:
+                return value
+        return to_int(raw)
+    return None
+
+
+def _ata_failed_attributes(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    attrs = payload.get("ata_smart_attributes")
+    table = attrs.get("table") if isinstance(attrs, dict) else None
+    if not isinstance(table, list):
+        return []
+    failed: List[Dict[str, Any]] = []
+    for row in table:
+        if not isinstance(row, dict):
+            continue
+        when_failed = str(row.get("when_failed") or "").strip()
+        value = to_int(row.get("value"))
+        thresh = to_int(row.get("thresh"))
+        if when_failed and when_failed not in {"-", "Never"}:
+            failed.append(row)
+        elif value is not None and thresh is not None and thresh > 0 and value <= thresh:
+            failed.append(row)
+    return failed
+
+
+def _apply_smartctl_ata_payload(snapshot: Snapshot, payload: Dict[str, Any], *, usb: bool = False) -> None:
+    """Normalize smartctl ATA/SATA JSON into the common Snapshot model."""
+    snapshot.tools["smartctl"] = payload
+    ci = snapshot.controller_info
+    ci["protocol"] = "ATA"
+    ci["native_nvme"] = False
+    ci["transport"] = "USB -> SATA" if usb else "SATA"
+    ci["model"] = payload.get("model_name") or payload.get("model_family") or ci.get("model")
+    ci["serial"] = payload.get("serial_number") or ci.get("serial")
+    ci["firmware_rev"] = payload.get("firmware_version") or ci.get("firmware_rev")
+    ci["wwn"] = payload.get("wwn")
+    ci["rotation_rate"] = payload.get("rotation_rate")
+    ci["form_factor"] = payload.get("form_factor")
+    ci["sata_version"] = payload.get("sata_version")
+    ci["interface_speed"] = payload.get("interface_speed")
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    if device.get("type"):
+        ci["smartctl_device_type"] = device.get("type")
+
+    smart_status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
+    temp = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
+    poh = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
+    error_log = payload.get("ata_smart_error_log") if isinstance(payload.get("ata_smart_error_log"), dict) else {}
+    error_summary = error_log.get("summary") if isinstance(error_log.get("summary"), dict) else {}
+
+    smart: Dict[str, Any] = {
+        "smart_passed": smart_status.get("passed"),
+        "temperature": temp.get("current"),
+        "power_on_hours": poh.get("hours"),
+        "power_cycles": payload.get("power_cycle_count"),
+        "reallocated_sectors": _ata_attr_raw(payload, 5),
+        "reported_uncorrectable": _ata_attr_raw(payload, 187),
+        "command_timeouts": _ata_attr_raw(payload, 188),
+        "current_pending_sectors": _ata_attr_raw(payload, 197),
+        "offline_uncorrectable": _ata_attr_raw(payload, 198),
+        "udma_crc_errors": _ata_attr_raw(payload, 199),
+        "ata_error_count": to_int(error_summary.get("count")),
+        "failed_attributes": _ata_failed_attributes(payload),
+    }
+    reserve = ata_reserved_space_indicator(payload)
+    if reserve:
+        smart["reserved_space"] = reserve.get("value")
+        smart["reserved_space_threshold"] = reserve.get("threshold")
+        smart["reserved_space_margin"] = reserve.get("margin")
+        smart["reserved_space_raw"] = reserve.get("raw")
+        smart["reserved_space_source"] = {
+            "attribute_id": reserve.get("attribute_id"),
+            "attribute_name": reserve.get("attribute_name"),
+            "sources": reserve.get("sources"),
+        }
+    wear = ata_media_wear_indicator(payload)
+    if wear:
+        smart["media_wear_indicator"] = wear.get("value")
+        smart["media_wear_threshold"] = wear.get("threshold")
+        smart["media_wear_raw"] = wear.get("raw")
+        smart["media_wear_source"] = {
+            "attribute_id": wear.get("attribute_id"),
+            "attribute_name": wear.get("attribute_name"),
+        }
+    snapshot.smart = {k: v for k, v in smart.items() if v is not None and v != []}
+    snapshot.capabilities["ata_smart"] = bool(snapshot.smart or smart_status)
+    if error_log:
+        snapshot.error_log = error_log
+        snapshot.capabilities["ata_error_log"] = True
+    selftest = payload.get("ata_smart_self_test_log")
+    if isinstance(selftest, dict):
+        snapshot.tools["ata_smart_self_test_log"] = selftest
+        snapshot.capabilities["ata_self_test_log"] = True
+    if payload.get("interface_speed") is not None or payload.get("sata_version") is not None:
+        snapshot.capabilities["sata_link"] = True
 
 def _smartctl_json_is_nvme(payload: Any) -> bool:
     if not isinstance(payload, dict):
@@ -150,6 +303,7 @@ def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_B
     scsi_host = None
     scsi_target = None
     scsi_lun = None
+    ata_port = None
     pci_host = None
 
     for node in chain:
@@ -160,6 +314,8 @@ def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_B
             scsi_target = name
         if scsi_lun is None and re.fullmatch(r"\d+:\d+:\d+:\d+", name):
             scsi_lun = name
+        if ata_port is None and re.fullmatch(r"ata\d+", name):
+            ata_port = name
         if usb_iface is None and re.fullmatch(r"\d+-[\d.]+:\d+\.\d+", name):
             usb_iface = node
         if usb_dev is None and (node / "idVendor").exists() and (node / "idProduct").exists():
@@ -168,11 +324,14 @@ def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_B
             pci_host = node
 
     if usb_dev is None:
+        tokens = [controller, ata_port, scsi_host, scsi_target, scsi_lun]
         return {
             "sysfs_device": str(leaf),
+            "ata_port": ata_port,
             "scsi_host": scsi_host,
             "scsi_target": scsi_target,
             "scsi_lun": scsi_lun,
+            "kernel_tokens": [str(x) for x in tokens if x],
         }
 
     speed_raw = read_text(usb_dev / "speed")
@@ -190,7 +349,7 @@ def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_B
     pid = read_text(usb_dev / "idProduct")
     port = usb_dev.name
 
-    tokens = [controller, port, scsi_host, scsi_target, scsi_lun]
+    tokens = [controller, port, ata_port, scsi_host, scsi_target, scsi_lun]
     if vid and pid:
         tokens += [f"{vid}:{pid}", vid, pid]
 
@@ -209,6 +368,7 @@ def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_B
         "busnum": read_text(usb_dev / "busnum"),
         "devnum": read_text(usb_dev / "devnum"),
         "interface_driver": iface_driver,
+        "ata_port": ata_port,
         "scsi_host": scsi_host,
         "scsi_target": scsi_target,
         "scsi_lun": scsi_lun,
@@ -216,6 +376,120 @@ def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_B
         "host_controller_driver": host_driver,
         "kernel_tokens": [str(x) for x in tokens if x],
     }
+
+
+def _parse_udevadm_properties(text: str) -> Dict[str, str]:
+    props: Dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        props[key.strip()] = value.strip()
+    return props
+
+
+def _udev_block_identity_linux(runner: Runner, device: str) -> Dict[str, Optional[str]]:
+    """Read non-SMART block identity from udev.
+
+    This is deliberately an inventory fallback, not a health source.  Native
+    SATA disks can be fully present even when smartctl returns SCSI-flavoured
+    or otherwise ambiguous JSON.  udev still normally carries the ATA model,
+    serial and firmware revision populated by the kernel/libata stack.
+    """
+    res = runner.run(["udevadm", "info", "--query=property", f"--name={device}"], timeout=2.0)
+    if not res.available or not res.stdout.strip():
+        return {}
+    props = _parse_udevadm_properties(res.stdout)
+    model = props.get("ID_MODEL") or props.get("ID_MODEL_FROM_DATABASE")
+    if model:
+        model = model.replace("_", " ").strip()
+    serial = props.get("ID_SERIAL_SHORT")
+    if not serial:
+        raw_serial = props.get("ID_SERIAL")
+        # ID_SERIAL often has MODEL_SERIAL.  Do not guess-split unless udev
+        # also provided a short serial; otherwise keep the complete value.
+        serial = raw_serial
+    firmware = props.get("ID_REVISION")
+    return {
+        "model": model or None,
+        "serial": serial or None,
+        "firmware": firmware or None,
+        "bus": props.get("ID_BUS") or None,
+    }
+
+
+def _linux_block_state(candidate: Dict[str, Any]) -> str:
+    """Normalize Linux block/SCSI state to nvme-doctor availability state."""
+    raw = str(candidate.get("sysfs_state") or "").strip().lower()
+    if raw in {"running", "live", "active"}:
+        return "live"
+    if raw in {"offline", "blocked", "quiesce", "transport-offline"}:
+        return raw
+    # An OS-visible whole block device is usable inventory-wise even when a
+    # particular kernel driver does not export device/state.
+    return "live" if candidate.get("sysfs_block") else "present"
+
+
+def _fallback_block_identity_linux(runner: Runner, device: str, candidate: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Merge non-SMART identity sources for list/topology output."""
+    udev = _udev_block_identity_linux(runner, device)
+    return {
+        "model": udev.get("model") or candidate.get("sysfs_model") or candidate.get("bridge_model"),
+        "serial": udev.get("serial") or candidate.get("sysfs_serial"),
+        "firmware": udev.get("firmware") or candidate.get("sysfs_firmware"),
+    }
+
+
+def _physical_block_candidates_linux(sys_class_block: Path = SYS_CLASS_BLOCK) -> Dict[str, Dict[str, Any]]:
+    """Enumerate host-visible SCSI-style whole disks independently of smartctl.
+
+    `smartctl --scan` is useful for backend hints, but it is not a reliable
+    device inventory: permission/backend failures can omit perfectly visible
+    SATA disks.  Start from Linux sysfs instead, then let smartctl classify the
+    protocol.  SCSI peripheral type 0 is a direct-access block disk; optical
+    and other non-disk sdX devices are excluded.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not sys_class_block.exists():
+        return out
+    for path in sorted(sys_class_block.glob("sd*")):
+        if not re.fullmatch(r"sd[a-z]+", path.name):
+            continue
+        peripheral_type = read_text(path / "device" / "type")
+        if peripheral_type not in (None, "0"):
+            continue
+        try:
+            real_device = (path / "device").resolve(strict=True)
+        except OSError:
+            real_device = None
+        model = read_text(path / "device" / "model")
+        vendor = read_text(path / "device" / "vendor")
+        revision = read_text(path / "device" / "rev")
+        serial = read_text(path / "device" / "serial")
+        state = read_text(path / "device" / "state")
+        label = " ".join(x for x in (vendor, model) if x).strip() or None
+        real_text = str(real_device).lower() if real_device else ""
+        is_usb = bool(real_device and "usb" in real_text)
+        # Linux libata exposes native SATA disks through a SCSI-compatible
+        # sdX block device, but the resolved sysfs path still contains an
+        # ataN component.  Treat that path as authoritative transport evidence
+        # when smartctl's generic identity probe is ambiguous.
+        is_ata = bool(real_device and any(re.fullmatch(r"ata\d+", part.lower()) for part in real_device.parts))
+        sectors = to_int(read_text(path / "size"))
+        out[f"/dev/{path.name}"] = {
+            "device": f"/dev/{path.name}",
+            "bridge_model": label,
+            "sysfs_model": model,
+            "sysfs_serial": serial,
+            "sysfs_firmware": revision,
+            "sysfs_state": state,
+            "sysfs_block": True,
+            "sysfs_usb": is_usb,
+            "sysfs_transport": "SATA" if is_ata and not is_usb else ("USB" if is_usb else "SCSI"),
+            "rotational": read_text(path / "queue" / "rotational"),
+            "size_bytes": sectors * 512 if sectors is not None else None,
+        }
+    return out
 
 
 def _usb_solid_state_candidates_linux(sys_class_block: Path = SYS_CLASS_BLOCK) -> Dict[str, Dict[str, Any]]:
@@ -257,12 +531,17 @@ def discover_controllers_linux(
     runner: Optional[Runner] = None,
     sys_class_block: Path = SYS_CLASS_BLOCK,
 ) -> List[Dict[str, Any]]:
-    """Discover both native NVMe and USB/SCSI-translated NVMe devices."""
+    """Discover native NVMe plus ATA/SATA and USB-translated storage devices."""
     runner = runner or Runner()
-    result = _discover_native_controllers_linux(sys_class_nvme)
+    result = _discover_native_controllers_linux(sys_class_nvme, sys_class_block)
     seen = {str(item.get("device")) for item in result}
 
     candidates = _smartctl_scan_candidates_linux(runner)
+    # OS inventory is authoritative for presence. smartctl scan output only
+    # enriches it with backend/protocol hints. This keeps native SATA disks in
+    # `list` even when smartctl --scan omits them.
+    for device, row in _physical_block_candidates_linux(sys_class_block).items():
+        candidates.setdefault(device, {}).update({k: v for k, v in row.items() if v is not None})
     for device, row in _usb_solid_state_candidates_linux(sys_class_block).items():
         candidates.setdefault(device, {}).update({k: v for k, v in row.items() if v is not None})
 
@@ -281,6 +560,24 @@ def discover_controllers_linux(
         device_type = candidate.get("device_type")
         probe = runner.run(_smartctl_args_linux(device, mode="-i", device_type=device_type), timeout=10.0)
         payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
+
+        # Some libata/SATA devices are exposed as sdX and smartctl's generic
+        # probe can return valid but SCSI-flavoured JSON.  If sysfs proves this
+        # is a native ataN path, retry with the explicit ATA backend before
+        # giving up classification.
+        if (
+            not _smartctl_json_is_nvme(payload)
+            and not _smartctl_json_is_ata(payload)
+            and candidate.get("sysfs_transport") == "SATA"
+            and not device_type
+        ):
+            ata_probe = runner.run(_smartctl_args_linux(device, mode="-i", device_type="ata"), timeout=6.0)
+            ata_payload = read_json(ata_probe.stdout) if ata_probe.available and ata_probe.stdout.strip() else None
+            if _smartctl_json_is_ata(ata_payload):
+                probe = ata_probe
+                payload = ata_payload
+                device_type = "ata"
+
         if _smartctl_json_is_nvme(payload):
             ident = _smartctl_identity(payload)
             result.append({
@@ -294,7 +591,32 @@ def discover_controllers_linux(
                 "smartctl_device_type": ident.get("smartctl_device_type") or candidate.get("device_type"),
                 "protocol": "NVMe",
                 "native_nvme": False,
+                "size_bytes": candidate.get("size_bytes"),
                 "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block),
+            })
+            continue
+
+        if _smartctl_json_is_ata(payload):
+            device_info = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+            usb_path = _collect_usb_path_linux(Path(device).name, sys_class_block)
+            is_usb = bool(usb_path.get("usb_port"))
+            fallback_ident = {}
+            if not payload.get("model_name") or not payload.get("serial_number") or not payload.get("firmware_version"):
+                fallback_ident = _fallback_block_identity_linux(runner, device, candidate)
+            result.append({
+                "controller": Path(device).name,
+                "device": device,
+                "model": payload.get("model_name") or fallback_ident.get("model") or candidate.get("bridge_model"),
+                "serial": payload.get("serial_number") or fallback_ident.get("serial"),
+                "firmware": payload.get("firmware_version") or fallback_ident.get("firmware"),
+                "state": _linux_block_state(candidate),
+                "transport": "USB -> SATA" if is_usb else "SATA",
+                "smartctl_device_type": device_info.get("type") or candidate.get("device_type"),
+                "protocol": "ATA",
+                "native_nvme": False,
+                "usb_path": usb_path if is_usb else {},
+                "rotation_rate": payload.get("rotation_rate"),
+                "size_bytes": candidate.get("size_bytes"),
             })
             continue
 
@@ -314,23 +636,49 @@ def discover_controllers_linux(
                 "native_nvme": False,
                 "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block),
                 "probe_note": "NVMe bridge detected; run list/check as root for identity/health access",
+                "size_bytes": candidate.get("size_bytes"),
             })
             continue
 
-        # Last-resort visibility for an unprivileged list: show a USB solid-state
-        # block device as an *unverified candidate*, never as confirmed NVMe.
-        if candidate.get("sysfs_usb") and (not probe.available or probe.returncode != 0 or payload is None):
+        # Last-resort visibility: an OS-visible whole disk must never disappear
+        # merely because smartctl returned unsupported/ambiguous JSON.  Native
+        # libata sysfs paths are strong enough to label the transport SATA even
+        # when SMART identity remains unavailable.
+        if candidate.get("sysfs_block"):
+            is_usb = bool(candidate.get("sysfs_usb"))
+            rotational = str(candidate.get("rotational") or "").strip()
+            sysfs_transport = candidate.get("sysfs_transport")
+            fallback_ident = _fallback_block_identity_linux(runner, device, candidate)
+            if sysfs_transport == "SATA":
+                transport = "SATA"
+                protocol = "ATA"
+                state = _linux_block_state(candidate)
+                note = "SATA transport identified from Linux libata sysfs; SMART protocol probe was ambiguous"
+            elif is_usb:
+                transport = "USB disk (protocol unverified)"
+                protocol = None
+                state = "probe-needed"
+                note = "USB disk is present, but its underlying protocol could not be identified from SMART"
+            else:
+                transport = "SCSI disk (protocol unverified)"
+                protocol = None
+                state = "probe-needed"
+                note = "physical disk is present, but its protocol could not be identified from SMART"
             result.append({
                 "controller": Path(device).name,
                 "device": device,
-                "model": candidate.get("bridge_model"),
-                "serial": None,
-                "firmware": None,
-                "state": "probe-needed",
-                "transport": "USB SSD (NVMe unverified)",
+                "model": fallback_ident.get("model") or candidate.get("bridge_model"),
+                "serial": fallback_ident.get("serial"),
+                "firmware": fallback_ident.get("firmware"),
+                "state": state,
+                "transport": transport,
+                "protocol": protocol,
                 "native_nvme": False,
-                "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block),
-                "probe_note": "protocol could not be identified without SMART access; rerun with sudo",
+                "smartctl_device_type": "ata" if sysfs_transport == "SATA" else candidate.get("device_type"),
+                "rotation_rate": None if rotational == "0" else ("rotational" if rotational == "1" else None),
+                "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block) if is_usb else {},
+                "probe_note": note,
+                "size_bytes": candidate.get("size_bytes"),
             })
 
     return result
@@ -596,7 +944,7 @@ def collect_topology_linux(
         usb_path = _collect_usb_path_linux(controller, sys_class_block)
         ci: Dict[str, Any] = {
             "state": "present" if block.exists() else "missing",
-            "transport": "USB/SCSI -> NVMe",
+            "transport": "USB/SCSI block device",
             "native_nvme": False,
             "usb_bridge_model": bridge_candidate.get("bridge_model"),
             "smartctl_device_type": device_type,
@@ -612,12 +960,24 @@ def collect_topology_linux(
                 "firmware_rev": ident.get("firmware"),
                 "nvme_version": ident.get("nvme_version"),
                 "protocol": "NVMe",
+                "transport": "USB -> NVMe" if usb_path.get("usb_port") else "translated NVMe",
+                "identity_source": "smartctl",
+            })
+        elif _smartctl_json_is_ata(payload):
+            ci.update({
+                "model": payload.get("model_name"),
+                "serial": payload.get("serial_number"),
+                "firmware_rev": payload.get("firmware_version"),
+                "protocol": "ATA",
+                "transport": "USB -> SATA" if usb_path.get("usb_port") else "SATA",
+                "sata_version": payload.get("sata_version"),
+                "interface_speed": payload.get("interface_speed"),
                 "identity_source": "smartctl",
             })
         else:
             ci["identity_source"] = "unavailable"
             if probe.available and probe.returncode not in (0, None):
-                ci["identity_note"] = "underlying NVMe identity was not readable; rerun topology with sudo"
+                ci["identity_note"] = "storage identity was not readable; rerun topology with sudo"
         ns: Dict[str, Any] = {"name": controller, "device": device_path}
         sectors = read_text(block / "size")
         logical = read_text(block / "queue" / "logical_block_size")
@@ -631,9 +991,14 @@ def collect_topology_linux(
                 ns["logical_block_size"] = int(logical)
         except ValueError:
             pass
-        notes = [
-            "The SSD is accessed through a USB/SCSI bridge. Its native NVMe PCIe endpoint, PCIe generation/link, AER and NUMA ancestry are hidden behind the bridge; the host USB/block path and underlying NVMe identity are shown when available."
-        ]
+        if ci.get("protocol") == "ATA":
+            notes = [
+                "The ATA/SATA drive is exposed as a Linux block device. SMART identity/health and SATA interface speed are available through smartctl; USB bridges may hide the native SATA host-controller path."
+            ]
+        else:
+            notes = [
+                "The SSD is accessed through a USB/SCSI bridge. Its native NVMe PCIe endpoint, PCIe generation/link, AER and NUMA ancestry are hidden behind the bridge; the host USB/block path and underlying NVMe identity are shown when available."
+            ]
         if ci.get("identity_note"):
             notes.append(str(ci.get("identity_note")))
         return {
@@ -866,6 +1231,10 @@ def collect_snapshot_linux(
     snapshot.capabilities = {
         "nvme_smart": False,
         "nvme_error_log": False,
+        "ata_smart": False,
+        "ata_error_log": False,
+        "ata_self_test_log": False,
+        "sata_link": False,
         "device_inventory": True,
         "pcie_link": native_nvme,
         "pcie_aer": native_nvme,
@@ -879,42 +1248,126 @@ def collect_snapshot_linux(
         # NVMe sysfs cannot address that path, but smartctl can on Linux when
         # the bridge supports NVMe admin passthrough (as proven by smartctl -a).
         if progress:
-            progress("Detecting translated NVMe / USB bridge backend")
+            progress("Detecting block protocol / bridge backend")
         scan_candidate = _smartctl_candidate_linux(runner, device_path)
-        device_type = scan_candidate.get("device_type")
+        physical_candidate = _physical_block_candidates_linux(sys_class_block).get(device_path, {})
+        candidate = dict(physical_candidate)
+        candidate.update(scan_candidate)
+        sysfs_transport = candidate.get("sysfs_transport")
+        fallback_ident = _fallback_block_identity_linux(runner, device_path, candidate)
+
+        # `list` and `check` must resolve the same device identity/state.  Do
+        # this before SMART collection so a health-backend failure cannot erase
+        # model/serial/firmware or downgrade a running SATA disk to `present`.
         if progress:
             progress("Reading USB/SCSI path from sysfs")
         usb_path = _collect_usb_path_linux(controller, sys_class_block)
+        is_usb = bool(isinstance(usb_path, dict) and usb_path.get("usb_port"))
+        initial_transport = "SATA" if sysfs_transport == "SATA" else ("USB disk" if candidate.get("sysfs_usb") else "SCSI disk")
+        scan_type = candidate.get("device_type")
+        preferred_type = "ata" if sysfs_transport == "SATA" else scan_type
         snapshot.controller_info.update({
-            "state": "present",
+            "state": _linux_block_state(candidate),
             "sysfs_present": (sys_class_block / controller).exists(),
-            "transport": "USB/SCSI -> NVMe",
+            "transport": initial_transport,
+            "protocol": "ATA" if sysfs_transport == "SATA" else None,
             "native_nvme": False,
-            "smartctl_device_type": device_type,
-            "usb_path": usb_path,
+            "smartctl_device_type": preferred_type,
+            "usb_path": usb_path if is_usb else {},
+            "model": fallback_ident.get("model"),
+            "serial": fallback_ident.get("serial"),
+            "firmware_rev": fallback_ident.get("firmware"),
         })
+
         if progress:
-            progress("Reading NVMe identity and health through smartctl")
-        smartctl = _read_tool_json(
-            runner,
-            _smartctl_args_linux(device_path, mode="-a", device_type=device_type),
-            snapshot.collection_notes,
-            accept_json_on_nonzero=True,
-        )
+            progress("Reading SMART identity and health through smartctl")
+
+        # Native libata devices are sometimes reported as generic SCSI by a
+        # smartctl auto/scan probe.  Try a small ordered backend ladder and keep
+        # the payload with the strongest ATA evidence instead of letting one
+        # ambiguous scan hint (for example `-d scsi`) suppress ATA SMART.
+        backend_types = []
+        if sysfs_transport == "SATA":
+            for dtype in ("ata", None, "sat"):
+                if dtype not in backend_types:
+                    backend_types.append(dtype)
+        else:
+            backend_types.append(scan_type)
+
+        smartctl = None
+        selected_type = preferred_type
+        best_score = -1
+        selected_rc = None
+        for dtype in backend_types:
+            res = runner.run(_smartctl_args_linux(device_path, mode="-a", device_type=dtype), timeout=8.0)
+            payload = read_json(res.stdout) if res.available and res.stdout.strip() else None
+            if not isinstance(payload, dict):
+                continue
+            score = 0
+            if _smartctl_json_is_nvme(payload):
+                score = 1000
+            elif _smartctl_json_is_ata(payload):
+                score = 500
+                if isinstance(payload.get("smart_status"), dict):
+                    score += 100
+                if isinstance(payload.get("ata_smart_attributes"), dict):
+                    score += 200
+                if isinstance(payload.get("ata_smart_data"), dict):
+                    score += 100
+                if isinstance(payload.get("ata_smart_error_log"), dict):
+                    score += 25
+            else:
+                # Still preserve useful identity from an ambiguous response.
+                score = sum(bool(payload.get(k)) for k in ("model_name", "model_number", "serial_number", "firmware_version"))
+            if score > best_score:
+                smartctl = payload
+                selected_type = dtype
+                selected_rc = res.returncode
+                best_score = score
+            # Full ATA health evidence is enough; do not add needless probes.
+            if score >= 700:
+                break
+
+        if selected_type:
+            snapshot.controller_info["smartctl_device_type"] = selected_type
+        if selected_rc is not None and (selected_rc & 0x07):
+            snapshot.collection_notes.append(
+                f"smartctl returned collection-status bits 0x{selected_rc & 0x07:02x}; valid JSON was retained"
+            )
+
         if isinstance(smartctl, dict) and _smartctl_json_is_nvme(smartctl):
             _apply_smartctl_nvme_payload(snapshot, smartctl, translated=True)
             snapshot.collection_notes.append(
                 "NVMe is accessed through a USB/SCSI block device; native nvme-cli, PCIe AER/link, NUMA and endpoint topology are hidden by the bridge"
             )
+        elif isinstance(smartctl, dict) and _smartctl_json_is_ata(smartctl):
+            is_usb = bool(isinstance(usb_path, dict) and usb_path.get("usb_port"))
+            _apply_smartctl_ata_payload(snapshot, smartctl, usb=is_usb)
+            snapshot.controller_info["state"] = _linux_block_state(candidate)
+            snapshot.controller_info["model"] = snapshot.controller_info.get("model") or fallback_ident.get("model")
+            snapshot.controller_info["serial"] = snapshot.controller_info.get("serial") or fallback_ident.get("serial")
+            snapshot.controller_info["firmware_rev"] = snapshot.controller_info.get("firmware_rev") or fallback_ident.get("firmware")
+            snapshot.controller_info["usb_path"] = usb_path if is_usb else {}
+            if is_usb:
+                snapshot.collection_notes.append(
+                    "SATA/ATA SMART is accessed through a USB-SATA/SAT bridge; native SATA host-controller details may be hidden by the enclosure"
+                )
+            else:
+                snapshot.collection_notes.append("ATA/SATA health collected through smartctl")
         elif isinstance(smartctl, dict):
             snapshot.tools["smartctl"] = smartctl
-            snapshot.controller_info["nvme_passthrough"] = False
-            snapshot.controller_info["passthrough_reason"] = "linux-smartctl-not-nvme"
-            snapshot.collection_notes.append(
-                f"{device_path} is a block device, but smartctl did not identify an NVMe protocol behind it"
-            )
+            if sysfs_transport == "SATA":
+                snapshot.controller_info["protocol"] = "ATA"
+                snapshot.controller_info["transport"] = "SATA"
+                snapshot.collection_notes.append(
+                    f"{device_path} is on a Linux libata SATA path, but smartctl did not expose ATA SMART with the available backend"
+                )
+            else:
+                snapshot.controller_info["protocol"] = _smartctl_json_protocol(smartctl) or "unknown"
+                snapshot.collection_notes.append(
+                    f"{device_path} is a block device, but smartctl did not identify a supported NVMe or ATA/SATA protocol"
+                )
         else:
-            snapshot.controller_info["nvme_passthrough"] = False
             snapshot.controller_info["passthrough_reason"] = "linux-smartctl-unavailable"
 
         # Keep kernel evidence scoped to the block-device name.  This can catch
@@ -940,6 +1393,7 @@ def collect_snapshot_linux(
     if controller_path.exists():
         snapshot.controller_info.update(_collect_controller_sysfs(controller_path))
         snapshot.controller_info["native_nvme"] = True
+        snapshot.controller_info["protocol"] = "NVMe"
     else:
         snapshot.controller_info.update({"state": "missing", "sysfs_present": False, "native_nvme": True})
         snapshot.collection_notes.append(f"{controller_path} is not present; controller may be disconnected or removed")

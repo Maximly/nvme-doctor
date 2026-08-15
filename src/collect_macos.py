@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .model import Snapshot
 from .runner import Runner
-from .util import normalize_macos_device, read_json, to_int
+from .util import normalize_macos_device, read_json, ata_media_wear_indicator, ata_reserved_space_indicator, smartctl_percent, to_int
 
 
 def _system_profiler_nvme(runner: Runner, notes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -221,6 +221,135 @@ def _diskutil_target_disk(
     }
 
 
+def _smartctl_protocol(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    protocol = str(device.get("protocol") or "").strip().lower()
+    dtype = str(device.get("type") or "").strip().lower()
+    if protocol == "nvme" or "nvme" in dtype or payload.get("nvme_version") is not None or isinstance(payload.get("nvme_smart_health_information_log"), dict):
+        return "NVMe"
+    ata_evidence = protocol in {"ata", "sata"} or payload.get("sata_version") is not None or isinstance(payload.get("ata_smart_attributes"), dict)
+    if ata_evidence or ((dtype == "ata" or dtype.startswith("sat")) and protocol not in {"scsi", "sas"}):
+        return "ATA"
+    return None
+
+
+def _ata_attr_raw(payload: Dict[str, Any], attr_id: int) -> Optional[int]:
+    attrs = payload.get("ata_smart_attributes")
+    table = attrs.get("table") if isinstance(attrs, dict) else None
+    if not isinstance(table, list):
+        return None
+    for row in table:
+        if not isinstance(row, dict) or to_int(row.get("id")) != attr_id:
+            continue
+        raw = row.get("raw")
+        if isinstance(raw, dict):
+            return to_int(raw.get("value"))
+        return to_int(raw)
+    return None
+
+
+def _ata_failed_attributes(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    attrs = payload.get("ata_smart_attributes")
+    table = attrs.get("table") if isinstance(attrs, dict) else None
+    if not isinstance(table, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in table:
+        if not isinstance(row, dict):
+            continue
+        when_failed = str(row.get("when_failed") or "").strip()
+        value = to_int(row.get("value"))
+        thresh = to_int(row.get("thresh"))
+        if (when_failed and when_failed not in {"-", "Never"}) or (value is not None and thresh is not None and thresh > 0 and value <= thresh):
+            out.append(row)
+    return out
+
+
+def _apply_ata_payload(snapshot: Snapshot, payload: Dict[str, Any], *, usb: bool = False) -> None:
+    snapshot.tools["smartctl"] = payload
+    ci = snapshot.controller_info
+    ci.update({
+        "state": "live",
+        "protocol": "ATA",
+        "native_nvme": False,
+        "transport": "USB -> SATA" if usb else "SATA",
+        "model": payload.get("model_name") or ci.get("model"),
+        "serial": payload.get("serial_number") or ci.get("serial"),
+        "firmware_rev": payload.get("firmware_version") or ci.get("firmware_rev"),
+        "rotation_rate": payload.get("rotation_rate"),
+        "form_factor": payload.get("form_factor"),
+        "sata_version": payload.get("sata_version"),
+        "interface_speed": payload.get("interface_speed"),
+    })
+    dev = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    if dev.get("type"):
+        ci["smartctl_device_type"] = dev.get("type")
+    status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
+    temp = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
+    poh = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
+    err = payload.get("ata_smart_error_log") if isinstance(payload.get("ata_smart_error_log"), dict) else {}
+    summary = err.get("summary") if isinstance(err.get("summary"), dict) else {}
+    smart = {
+        "smart_passed": status.get("passed"),
+        "temperature": temp.get("current"),
+        "power_on_hours": poh.get("hours"),
+        "power_cycles": payload.get("power_cycle_count"),
+        "reallocated_sectors": _ata_attr_raw(payload, 5),
+        "reported_uncorrectable": _ata_attr_raw(payload, 187),
+        "command_timeouts": _ata_attr_raw(payload, 188),
+        "current_pending_sectors": _ata_attr_raw(payload, 197),
+        "offline_uncorrectable": _ata_attr_raw(payload, 198),
+        "udma_crc_errors": _ata_attr_raw(payload, 199),
+        "ata_error_count": to_int(summary.get("count")),
+        "failed_attributes": _ata_failed_attributes(payload),
+    }
+    reserve = ata_reserved_space_indicator(payload)
+    if reserve:
+        smart["reserved_space"] = reserve.get("value")
+        smart["reserved_space_threshold"] = reserve.get("threshold")
+        smart["reserved_space_margin"] = reserve.get("margin")
+        smart["reserved_space_raw"] = reserve.get("raw")
+        smart["reserved_space_source"] = {
+            "attribute_id": reserve.get("attribute_id"),
+            "attribute_name": reserve.get("attribute_name"),
+            "sources": reserve.get("sources"),
+        }
+    wear = ata_media_wear_indicator(payload)
+    if wear:
+        smart["media_wear_indicator"] = wear.get("value")
+        smart["media_wear_threshold"] = wear.get("threshold")
+        smart["media_wear_raw"] = wear.get("raw")
+        smart["media_wear_source"] = {
+            "attribute_id": wear.get("attribute_id"),
+            "attribute_name": wear.get("attribute_name"),
+        }
+    snapshot.smart = {k: v for k, v in smart.items() if v is not None and v != []}
+    snapshot.capabilities["ata_smart"] = bool(snapshot.smart or status)
+    if err:
+        snapshot.error_log = err
+        snapshot.capabilities["ata_error_log"] = True
+    selftest = payload.get("ata_smart_self_test_log")
+    if isinstance(selftest, dict):
+        snapshot.tools["ata_smart_self_test_log"] = selftest
+        snapshot.capabilities["ata_self_test_log"] = True
+    if payload.get("interface_speed") is not None or payload.get("sata_version") is not None:
+        snapshot.capabilities["sata_link"] = True
+
+
+def _smartctl_identity_probe_any(runner: Runner, device: str, device_type: Optional[str] = None, timeout: float = 6.0) -> Optional[Dict[str, Any]]:
+    argv = ["smartctl", "-i", "-j"]
+    if device_type:
+        argv += ["-d", device_type]
+    argv.append(device)
+    res = runner.run(argv, timeout=timeout)
+    if not res.available or not res.stdout.strip():
+        return None
+    payload = read_json(res.stdout)
+    return payload if isinstance(payload, dict) and _smartctl_protocol(payload) else None
+
+
 def _smartctl_identity_probe(
     runner: Runner,
     device: str,
@@ -297,14 +426,24 @@ def _parse_smartctl_scan(text: str) -> List[Dict[str, str]]:
             continue
         raw_device = m.group("device")
         dtype = m.group("type") or ""
-        is_nvme = "nvme" in line.lower() or dtype.lower() == "nvme" or dtype.lower().startswith("snt")
-        if not is_nvme:
+        low = line.lower()
+        dtype_low = dtype.lower()
+        supported = (
+            "nvme" in low or "ata" in low or "sata" in low
+            or dtype_low == "nvme" or dtype_low.startswith("snt")
+            or dtype_low == "ata" or dtype_low.startswith("sat")
+        )
+        if not supported:
             continue
         item = {"device": _canonical_macos_path(raw_device)}
         if raw_device != item["device"]:
             item["smartctl_device"] = raw_device
         if dtype:
             item["smartctl_type"] = dtype
+        if "nvme" in low or dtype_low == "nvme" or dtype_low.startswith("snt"):
+            item["protocol_hint"] = "NVMe"
+        elif "ata" in low or "sata" in low or dtype_low == "ata" or dtype_low.startswith("sat"):
+            item["protocol_hint"] = "ATA"
         item["scan_line"] = line
         out.append(item)
     return out
@@ -424,7 +563,7 @@ def _macos_log(runner: Runner, tokens: Iterable[str], max_lines: int) -> List[st
     clean = [str(t).strip() for t in tokens if t and len(str(t).strip()) >= 4]
     if not clean:
         return []
-    predicate = 'eventMessage CONTAINS[c] "NVMe" OR eventMessage CONTAINS[c] "IONVMe" OR eventMessage CONTAINS[c] "ANS"'
+    predicate = 'eventMessage CONTAINS[c] "NVMe" OR eventMessage CONTAINS[c] "IONVMe" OR eventMessage CONTAINS[c] "ANS" OR eventMessage CONTAINS[c] "SATA" OR eventMessage CONTAINS[c] "AHCI" OR eventMessage CONTAINS[c] "I/O error"'
     res = runner.run(["log", "show", "--last", "1d", "--style", "compact", "--predicate", predicate], timeout=15.0)
     if not res.available or res.returncode != 0:
         return []
@@ -454,6 +593,7 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
             "firmware": ci.get("firmware_rev"),
             "state": ci.get("state", "present"),
             "transport": "NVMe",
+            "protocol": "NVMe",
             "smart_status": ci.get("smart_status"),
             "backend": "system_profiler",
         }
@@ -462,26 +602,43 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
     for item in scan:
         dev = _canonical_macos_path(item["device"])
         name = dev.rsplit("/", 1)[-1]
+        hint = item.get("protocol_hint") or "NVMe"
         current = by_device.setdefault(dev, {
             "controller": name,
             "device": dev,
             "state": "present",
-            "transport": "NVMe",
+            "transport": "SATA" if hint == "ATA" else "NVMe",
+            "protocol": hint,
             "backend": "smartctl-scan",
         })
         if item.get("smartctl_type"):
             current["smartctl_type"] = item["smartctl_type"]
-            if str(item["smartctl_type"]).lower().startswith("snt"):
+            dtype = str(item["smartctl_type"]).lower()
+            if dtype.startswith("snt"):
                 current["transport"] = "USB -> NVMe"
+            elif dtype.startswith("sat"):
+                current["transport"] = "USB -> SATA"
         if item.get("smartctl_device"):
             current["smartctl_device"] = item["smartctl_device"]
         current["smartctl_scan"] = True
         probe_device = item.get("smartctl_device") or dev
-        identity = _smartctl_identity_probe(runner, probe_device, item.get("smartctl_type"))
+        identity = _smartctl_identity_probe_any(runner, probe_device, item.get("smartctl_type"))
         if identity:
-            for key, value in _identity_fields(identity).items():
-                if value not in (None, "") and not current.get(key):
-                    current[key] = value
+            proto = _smartctl_protocol(identity)
+            current["protocol"] = proto
+            if proto == "ATA":
+                current["model"] = identity.get("model_name") or current.get("model")
+                current["serial"] = identity.get("serial_number") or current.get("serial")
+                current["firmware"] = identity.get("firmware_version") or current.get("firmware")
+                if str(item.get("smartctl_type") or "").lower().startswith("sat"):
+                    current["transport"] = "USB -> SATA"
+                else:
+                    current["transport"] = "SATA"
+                current["rotation_rate"] = identity.get("rotation_rate")
+            else:
+                for key, value in _identity_fields(identity).items():
+                    if value not in (None, "") and not current.get(key):
+                        current[key] = value
 
     # SPNVMeDataType normally omits USB-attached NVMe.  Use diskutil only to
     # enumerate real external whole disks, then prove NVMe with one of the
@@ -492,21 +649,69 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
             current = by_device[dev]
             current.setdefault("bus_protocol", candidate.get("bus_protocol"))
             current.setdefault("internal", candidate.get("internal"))
-            continue
-        if candidate.get("internal") is True:
+            current.setdefault("size_bytes", candidate.get("size_bytes"))
             continue
         bus = str(candidate.get("bus_protocol") or "").lower()
-        # SNT is a USB/SCSI translation mechanism.  Avoid issuing vendor
-        # bridge probes against unrelated Thunderbolt/FireWire physical disks.
+        if candidate.get("internal") is True:
+            if "sata" in bus or "ata" in bus:
+                by_device[dev] = {
+                    "controller": candidate["controller"],
+                    "device": dev,
+                    "model": candidate.get("model"),
+                    "serial": candidate.get("serial"),
+                    "firmware": candidate.get("firmware"),
+                    "state": "probe-needed",
+                    "transport": "SATA",
+                    "protocol": "ATA",
+                    "bus_protocol": candidate.get("bus_protocol"),
+                    "internal": True,
+                    "size_bytes": candidate.get("size_bytes"),
+                    "smart_status": candidate.get("smart_status"),
+                    "backend": "diskutil",
+                }
+            continue
+        # SNT/SAT are USB/SCSI translation mechanisms. Avoid bridge probes
+        # against unrelated Thunderbolt/FireWire physical disks.
         if bus and "usb" not in bus:
             continue
-        # Current smartmontools Darwin builds have no SCSI device backend.
+
+        # `smartctl --scan` is not a complete physical-disk inventory on macOS.
+        # A USB-SATA bridge may be absent from scan output while `diskutil` sees
+        # the disk and `smartctl -d sat` can still identify the underlying ATA
+        # device. Probe identity only (short timeout) so `list` classifies SATA
+        # HDDs/SSDs instead of hiding them behind a generic "USB disk" row.
+        sat_identity = _smartctl_identity_probe_any(runner, dev, "sat", timeout=1.5)
+        if isinstance(sat_identity, dict) and _smartctl_protocol(sat_identity) == "ATA":
+            device_info = sat_identity.get("device") if isinstance(sat_identity.get("device"), dict) else {}
+            by_device[dev] = {
+                "controller": candidate["controller"],
+                "device": dev,
+                "model": sat_identity.get("model_name") or candidate.get("model"),
+                "serial": sat_identity.get("serial_number") or candidate.get("serial"),
+                "firmware": sat_identity.get("firmware_version") or candidate.get("firmware"),
+                "state": "present",
+                "transport": "USB -> SATA",
+                "protocol": "ATA",
+                "smartctl_type": device_info.get("type") or "sat",
+                "smartctl_device": dev,
+                "bus_protocol": candidate.get("bus_protocol") or "USB",
+                "internal": candidate.get("internal"),
+                "size_bytes": candidate.get("size_bytes"),
+                "smart_status": candidate.get("smart_status"),
+                "rotation_rate": sat_identity.get("rotation_rate"),
+                "backend": "diskutil+smartctl-sat",
+            }
+            continue
+
+        # Current smartmontools Darwin builds have no SCSI device backend for
+        # SNT NVMe bridges. Keep unclassified USB media visible below.
         # The snt* bridge modes therefore cannot be forced on /dev/diskN or
         # /dev/rdiskN: they require a SCSI tunnel device underneath.  Keep
         # the physical SSD visible but explicitly limited.  If a future
         # smartctl scan reports this device as NVMe/SNT, the scan path above
         # will take precedence automatically.
-        if candidate.get("solid_state") is True and (not bus or "usb" in bus):
+        if not bus or "usb" in bus:
+            is_ssd = candidate.get("solid_state") is True
             by_device[dev] = {
                 "controller": candidate["controller"],
                 "device": dev,
@@ -514,13 +719,13 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
                 "serial": candidate.get("serial"),
                 "firmware": candidate.get("firmware"),
                 "state": "limited",
-                "transport": "USB SSD",
+                "transport": "USB SSD" if is_ssd else "USB disk",
                 "bus_protocol": candidate.get("bus_protocol") or "USB",
                 "internal": candidate.get("internal"),
                 "size_bytes": candidate.get("size_bytes"),
                 "smart_status": candidate.get("smart_status"),
-                "nvme_passthrough": False,
-                "passthrough_reason": "darwin-no-scsi-passthrough",
+                "nvme_passthrough": False if is_ssd else None,
+                "passthrough_reason": "darwin-no-scsi-passthrough" if is_ssd else "smart-passthrough-unavailable",
                 "backend": "diskutil",
             }
 
@@ -717,6 +922,10 @@ def collect_snapshot_macos(
     snapshot.capabilities = {
         "nvme_smart": False,
         "nvme_error_log": False,
+        "ata_smart": False,
+        "ata_error_log": False,
+        "ata_self_test_log": False,
+        "sata_link": False,
         "device_inventory": True,
         "pcie_link": False,
         "pcie_aer": False,
@@ -735,24 +944,86 @@ def collect_snapshot_macos(
     if progress:
         progress("Reading disk metadata with diskutil")
     target_physical = _diskutil_target_disk(runner, controller, snapshot.collection_notes)
-    if target_physical and target_physical.get("internal") is not True:
+    if target_physical:
         bus = str(target_physical.get("bus_protocol") or "").lower()
-        if target_physical.get("solid_state") is True and (not bus or "usb" in bus):
-            _populate_external_usb_snapshot(
-                snapshot,
-                target_physical,
-                controller=controller,
-                device_path=device_path,
-                direct_usb=direct_usb,
-                auto_direct_usb=auto_direct_usb,
-                direct_usb_mount_state_checked=direct_usb_mount_state_checked,
-                direct_usb_mounts_before=direct_usb_mounts_before,
-                usb_extra_logs=usb_extra_logs,
-                progress=progress,
-            )
+
+        # Native SATA/ATA on macOS: smartctl can expose ATA SMART directly.
+        if "sata" in bus or "ata" in bus:
             if progress:
-                progress("Evidence collection complete")
-            return snapshot
+                progress("Reading ATA/SATA SMART through smartctl")
+            payload = _smartctl_json(runner, device_path, None, snapshot.collection_notes)
+            if isinstance(payload, dict) and _smartctl_protocol(payload) == "ATA":
+                snapshot.controller_info.update({
+                    "backend": "diskutil+smartctl",
+                    "bus_protocol": target_physical.get("bus_protocol") or "SATA",
+                    "size_in_bytes": target_physical.get("size_bytes"),
+                    "solid_state": target_physical.get("solid_state"),
+                })
+                _apply_ata_payload(snapshot, payload, usb=False)
+                if progress:
+                    progress("Collecting target-scoped macOS storage events")
+                log_lines = _macos_log(runner, [snapshot.controller_info.get("serial"), snapshot.controller_info.get("model")], max(20, kernel_lines))
+                if log_lines:
+                    snapshot.kernel_lines = log_lines
+                    snapshot.capabilities["targeted_kernel_log"] = True
+                if progress:
+                    progress("Evidence collection complete")
+                return snapshot
+
+        # For a physical USB disk, first test the standard SAT backend. This
+        # covers USB-SATA HDDs/SSDs without disturbing the enclosure. If SAT
+        # does not identify ATA and the media is an SSD, continue to the
+        # existing RTL9210/NVMe path.
+        if target_physical.get("internal") is not True and (not bus or "usb" in bus):
+            if progress:
+                progress("Checking USB-SATA SAT passthrough")
+            ata_identity = _smartctl_identity_probe_any(runner, device_path, "sat", timeout=1.5)
+            if isinstance(ata_identity, dict) and _smartctl_protocol(ata_identity) == "ATA":
+                payload = _smartctl_json(runner, device_path, "sat", snapshot.collection_notes)
+                if isinstance(payload, dict) and _smartctl_protocol(payload) == "ATA":
+                    snapshot.controller_info.update({
+                        "backend": "diskutil+smartctl-sat",
+                        "bus_protocol": target_physical.get("bus_protocol") or "USB",
+                        "size_in_bytes": target_physical.get("size_bytes"),
+                        "solid_state": target_physical.get("solid_state"),
+                    })
+                    _apply_ata_payload(snapshot, payload, usb=True)
+                    if progress:
+                        progress("Evidence collection complete")
+                    return snapshot
+
+            if target_physical.get("solid_state") is True:
+                _populate_external_usb_snapshot(
+                    snapshot,
+                    target_physical,
+                    controller=controller,
+                    device_path=device_path,
+                    direct_usb=direct_usb,
+                    auto_direct_usb=auto_direct_usb,
+                    direct_usb_mount_state_checked=direct_usb_mount_state_checked,
+                    direct_usb_mounts_before=direct_usb_mounts_before,
+                    usb_extra_logs=usb_extra_logs,
+                    progress=progress,
+                )
+                if progress:
+                    progress("Evidence collection complete")
+                return snapshot
+            elif target_physical.get("internal") is not True:
+                snapshot.controller_info.update({
+                    "backend": "diskutil",
+                    "state": "limited",
+                    "model": target_physical.get("model"),
+                    "serial": target_physical.get("serial"),
+                    "firmware_rev": target_physical.get("firmware"),
+                    "transport": "USB disk",
+                    "bus_protocol": target_physical.get("bus_protocol") or "USB",
+                    "size_in_bytes": target_physical.get("size_bytes"),
+                    "solid_state": target_physical.get("solid_state"),
+                })
+                snapshot.collection_notes.append("USB disk is visible, but ATA/SATA SMART passthrough was not available through smartctl -d sat")
+                if progress:
+                    progress("Evidence collection complete")
+                return snapshot
 
     if progress:
         progress("Checking native NVMe inventory with system_profiler")
@@ -793,9 +1064,14 @@ def collect_snapshot_macos(
     smartctl_device = scan_item.get("smartctl_device") if scan_item else None
     if scan_item:
         snapshot.tools["smartctl_scan"] = scan_item
-        if str(device_type or "").lower().startswith("snt"):
+        dtype = str(device_type or "").lower()
+        hint = scan_item.get("protocol_hint")
+        if dtype.startswith("snt"):
             snapshot.controller_info["transport"] = "USB -> NVMe"
             snapshot.controller_info["bus_protocol"] = "USB"
+        elif dtype.startswith("sat") or hint == "ATA":
+            snapshot.controller_info["transport"] = "USB -> SATA" if dtype.startswith("sat") else "SATA"
+            snapshot.controller_info["protocol"] = "ATA"
 
     # USB NVMe may be absent from SPNVMeDataType and from smartctl's automatic
     # scan.  If diskutil proves this is an external physical disk, try the
@@ -917,16 +1193,20 @@ def collect_snapshot_macos(
                 progress("Reading SMART / NVMe health data")
             smartctl = _smartctl_json(runner, smartctl_device or device_path, device_type, snapshot.collection_notes)
     if isinstance(smartctl, dict):
-        snapshot.tools["smartctl"] = smartctl
-        _merge_smartctl_identity(snapshot, smartctl)
-        health = smartctl.get("nvme_smart_health_information_log")
-        if isinstance(health, dict):
-            snapshot.smart = health
-            snapshot.capabilities["nvme_smart"] = True
-        errors = smartctl.get("nvme_error_information_log")
-        if errors is not None:
-            snapshot.error_log = errors
-            snapshot.capabilities["nvme_error_log"] = True
+        proto = _smartctl_protocol(smartctl)
+        if proto == "ATA":
+            _apply_ata_payload(snapshot, smartctl, usb=str(snapshot.controller_info.get("transport") or "").startswith("USB"))
+        else:
+            snapshot.tools["smartctl"] = smartctl
+            _merge_smartctl_identity(snapshot, smartctl)
+            health = smartctl.get("nvme_smart_health_information_log")
+            if isinstance(health, dict):
+                snapshot.smart = health
+                snapshot.capabilities["nvme_smart"] = True
+            errors = smartctl.get("nvme_error_information_log")
+            if errors is not None:
+                snapshot.error_log = errors
+                snapshot.capabilities["nvme_error_log"] = True
 
     # system_profiler's Verified/Failing status is useful context but is not a
     # substitute for the standards-defined NVMe SMART/Health log.

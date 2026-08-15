@@ -18,6 +18,13 @@ _COUNTERS = [
     ("Critical-temp time", ("critical_comp_time",), "minutes"),
     ("Thermal mgmt T1", ("thm_temp1_trans_count", "thermal_mgmt_temp1_transition_count"), "count"),
     ("Thermal mgmt T2", ("thm_temp2_trans_count", "thermal_mgmt_temp2_transition_count"), "count"),
+    ("Reallocated sectors", ("reallocated_sectors",), "count"),
+    ("Pending sectors", ("current_pending_sectors",), "count"),
+    ("Offline uncorrectable", ("offline_uncorrectable",), "count"),
+    ("Reported uncorrectable", ("reported_uncorrectable",), "count"),
+    ("UDMA CRC errors", ("udma_crc_errors",), "count"),
+    ("ATA command timeouts", ("command_timeouts",), "count"),
+    ("ATA error log", ("ata_error_count",), "count"),
 ]
 
 
@@ -87,6 +94,20 @@ def compare_reports(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, 
             "title": "NVMe error-log activity increased",
             "detail": f"Error-information log count increased by {errs['delta']} in the captured interval; inspect the after-report error records.",
         })
+
+    for label, title, severity in [
+        ("Pending sectors", "Pending-sector count increased", "critical"),
+        ("Offline uncorrectable", "Offline-uncorrectable count increased", "critical"),
+        ("Reallocated sectors", "Reallocated-sector count increased", "warning"),
+        ("UDMA CRC errors", "SATA interface CRC count increased", "warning"),
+    ]:
+        item = by_label.get(label)
+        if item and item["delta"] > 0:
+            interpretations.append({
+                "severity": severity,
+                "title": title,
+                "detail": f"{label} increased by {item['delta']} in the captured interval.",
+            })
 
     if bgen is not None and agen is not None and bgen != agen:
         severity = "warning" if agen < bgen else "info"

@@ -7,22 +7,29 @@ DESTDIR=${DESTDIR:-}
 BINDIR="$DESTDIR$PREFIX/bin"
 CMD="$BINDIR/nvme-doctor"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ARTIFACT="$ROOT/nvme-doctor"
 ACTION=${1:-install}
 
 case "$ACTION" in
   install)
-    TMPDIR_BASE=${TMPDIR:-/tmp}
-    BUILD_DIR=$(mktemp -d "$TMPDIR_BASE/nvme-doctor.XXXXXX")
-    trap 'rm -rf "$BUILD_DIR"' EXIT HUP INT TERM
-    python3 "$ROOT/tools/build_single.py" "$BUILD_DIR/nvme-doctor"
+    if [ ! -f "$ARTIFACT" ]; then
+      echo "ERROR: pre-built nvme-doctor is missing: $ARTIFACT" >&2
+      echo "Run ./build.sh first, then rerun install.sh." >&2
+      exit 1
+    fi
+    if [ ! -x "$ARTIFACT" ]; then
+      echo "ERROR: pre-built nvme-doctor is not executable: $ARTIFACT" >&2
+      echo "Run ./build.sh first, then rerun install.sh." >&2
+      exit 1
+    fi
     install -d "$BINDIR"
-    install -m 0755 "$BUILD_DIR/nvme-doctor" "$CMD"
-    printf 'Installed nvme-doctor to %s\n' "$CMD"
+    install -m 0755 "$ARTIFACT" "$CMD"
+    printf 'Installed pre-built nvme-doctor to %s\n' "$CMD"
     "$CMD" --version
     ;;
   remove|uninstall)
     rm -f "$CMD"
-    printf 'Removed nvme-doctor from %s\n' "$PREFIX"
+    printf 'Removed nvme-doctor from %s\n' "$CMD"
     ;;
   *)
     echo "usage: $0 [install|remove]" >&2

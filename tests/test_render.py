@@ -91,7 +91,10 @@ def test_render_has_doctor_assessment_and_smartctl_version_object():
     assert "NVMe version         2.0" in text
     assert "{'string':" not in text
     assert "DOCTOR'S ASSESSMENT" in text
-    assert "Verdict              HEALTHY NOW" in text
+    assert "Verdict              HEALTHY" in text
+    assert "Near-term risk       LOW" in text
+    assert "Trend                UNKNOWN" in text
+    assert "HEALTHY NOW" not in text
     assert "Media / integrity    CLEAN" in text
     assert "PCIe / controller    CLEAN" in text
     assert "Thermal              NORMAL" in text

@@ -1,4 +1,74 @@
+## 1.1.12
+
+- `check` now rejects nonexistent device nodes before any SMART/NVMe probing.
+- A missing target such as `/dev/sdb` now returns a clear `device not found` error and exit code 4 instead of a fabricated `INCOMPLETE` SCSI snapshot.
+
+## 1.1.11
+
+- Rename the healthy quick-list status from `OK` to `GOOD` for clearer user-facing health semantics.
+- `nvme-doctor list` health values are now `GOOD`, `WARN`, `FAIL`, or `-`.
+
+## 1.1.10
+
+- Added a compact `Health` column to `nvme-doctor list`.
+- Quick list health uses non-disruptive SMART/OS status only: `OK`, `WARN`, `FAIL`, or `-`.
+- Independent per-disk health probes run concurrently with a short timeout so systems with many drives remain responsive.
+- macOS USB bridges that would require eject/direct capture are deliberately shown as `-` in `list`; use `check` for full health collection.
+
+## 1.1.8
+
+- Replace the ambiguous `HEALTHY NOW` assessment with `HEALTHY`.
+- Separate current health from `Near-term risk` and `Trend`.
+- Use `DEGRADED` for warning-level transport/controller/link/thermal conditions.
+- Use `AT RISK` for warning-level media/endurance evidence.
+- A single check no longer claims a stable/deteriorating trend; it reports `UNKNOWN` until reports are compared with `nvme-doctor diff`.
+- Keep future-risk wording explicit that it is not a time-to-failure prediction.
+
+## 1.1.7
+
+- Fix misleading ATA SSD spare interpretation: ignore smartctl's synthesized top-level `spare_available` when explicit ATA reserve-space attributes are available.
+- Use explicit `Available_*Reserv*` / spare-space SMART attributes for SATA reserve reporting, including threshold and margin.
+- Keep SMART 5 `Reallocated_Sector_Ct` strictly as a RAW reallocated-sector counter; its normalized VALUE is never interpreted as spare capacity.
+- Report vendor-defined media wear as a separate normalized indicator instead of converting it to generic endurance-used percentage.
+- Add a Solidigm D3-S4520 regression fixture reproducing `SMART 5 VALUE=47 RAW=0`, reserve attributes 170/232 at 100 with threshold 10, and wear indicator 233 at 100.
+
+## 1.1.6
+
+- Fixed SATA SSD percentage rendering when smartctl returns vendor JSON objects such as `spare_available: {"current_percent": 47}`.
+- Normalize ATA `spare_available` and `endurance_used` to scalar percentages before diagnosis/rendering on Linux and macOS.
+
+## 1.1.5
+
+- Normalize running Linux SATA/libata disks to `State=live` instead of the inventory-only `present` label.
+- Merge SATA list identity from smartctl, udev, and sysfs so model, serial, and firmware remain visible even when smartctl returns ambiguous SCSI-style JSON.
+- Use `/sys/class/block/<disk>/device/state` as the availability source for SATA rows.
+
+## 1.1.2
+
+- Fix `nvme-doctor list` omitting SATA disks when `smartctl --scan` does not report them.
+- Linux discovery now starts from `/sys/class/block/sd*` physical-disk inventory, then uses smartctl only to classify/enrich each disk.
+- Keep Linux physical disks visible as `probe-needed` when SMART access requires root or an unsupported backend instead of silently dropping them.
+- macOS discovery now probes `diskutil`-visible USB physical disks with a short read-only `smartctl -d sat -i` identity request so USB-SATA HDDs/SSDs can be classified even when smartctl scan output is incomplete.
+- Add regression coverage for native Linux SATA without scan output, unprivileged Linux SATA inventory, and macOS USB-SATA without scan output.
+
+## 1.1.1
+
+- Separate build and install flows.
+- Add `build.sh` as the release/developer build entry point; it rebuilds the root-level standalone `nvme-doctor`.
+- `install.sh` no longer invokes Python, `tools/build_single.py`, or any temporary build directory. It installs only the pre-built root-level `nvme-doctor` and fails with a clear message when that artifact is missing or non-executable.
+- `make build` delegates to `build.sh`; `make install` installs the existing artifact without an implicit rebuild.
+
 # Changelog
+
+## 1.1.0
+
+- Add ATA/SATA SSD and HDD discovery and health collection on Linux and macOS.
+- Add USB-SATA SAT bridge support through smartctl when pass-through is available.
+- Normalize ATA SMART overall status, sector integrity counters, CRC errors, command timeouts, temperature, lifetime counters, error log and self-test log.
+- Add SATA-specific diagnosis, assessment, rendering, capabilities and diff counters.
+- Add SATA revision/current/max interface-speed reporting when smartctl exposes it.
+- Preserve existing NVMe/RTL9210 behavior and keep the normal one-line Checking spinner UX.
+
 
 ## 1.0.13 - 2026-08-15
 

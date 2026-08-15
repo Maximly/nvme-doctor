@@ -1,7 +1,7 @@
 .PHONY: build test check install uninstall dist
 
 build:
-	python3 tools/build_single.py nvme-doctor
+	./build.sh
 
 test:
 	PYTHONPATH=. python3 -m pytest

@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -16,7 +17,8 @@ from .collect import collect_snapshot, collect_topology, discover_controllers
 from .diagnose import diagnose
 from .diff import compare_reports, render_diff_text
 from .render import render_json, render_text, render_topology_json, render_topology_text
-from .util import normalize_device, normalize_macos_device
+from .util import format_bytes_decimal, normalize_device, normalize_macos_device, read_json, to_int
+from .runner import Runner
 from .platforms import platform_key, platform_label
 
 
@@ -41,11 +43,20 @@ def _default_device() -> Optional[str]:
 def _device_or_error(value: Optional[str]) -> str:
     value = value or _default_device()
     if not value:
-        raise ValueError("device is required when zero or multiple NVMe controllers are present; run `nvme-doctor list`")
+        raise ValueError("device is required when zero or multiple supported storage devices are present; run `nvme-doctor list`")
+
     if platform_key() == "darwin":
-        normalize_macos_device(value)
+        _controller, device_path = normalize_macos_device(value)
     else:
-        normalize_device(value)
+        _controller, device_path = normalize_device(value)
+
+    # Validate the normalized whole-device node before invoking smartctl/nvme
+    # or constructing a diagnostic snapshot.  Without this guard smartctl can
+    # return valid JSON/error bits for a nonexistent /dev/sdX and the collector
+    # used to manufacture an INCOMPLETE ``SCSI disk`` record for it.
+    if not os.path.exists(device_path):
+        raise ValueError(f"device not found: {device_path}")
+
     return value
 
 
@@ -59,7 +70,7 @@ def _write_output(text: str, output: Optional[str]) -> None:
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("device", nargs="?", help="NVMe controller/namespace or USB-translated block device, e.g. /dev/nvme0, /dev/nvme0n1, or /dev/sdf")
+    parser.add_argument("device", nargs="?", help="NVMe controller/namespace or SATA/USB block device, e.g. /dev/nvme0, /dev/nvme0n1, /dev/sda, or disk4")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--verbose", "-v", action="store_true", help="include PCI topology and relevant kernel log lines")
     parser.add_argument("--kernel-lines", type=int, default=300, help="maximum number of relevant kernel log lines to keep (default: 300)")
@@ -82,19 +93,19 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nvme-doctor",
-        description="NVMe SSD diagnostics and root-cause analyzer for Linux and macOS",
+        description="NVMe and SATA storage diagnostics and root-cause analyzer for Linux and macOS",
     )
     parser.add_argument("--version", action="version", version=f"nvme-doctor {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    p_list = sub.add_parser("list", help="list NVMe devices visible to the current OS backend")
+    p_list = sub.add_parser("list", help="list supported NVMe and SATA/ATA devices visible to the current OS backend")
     p_list.add_argument("--json", action="store_true", help="emit JSON")
 
-    p_check = sub.add_parser("check", help="collect evidence and diagnose one NVMe controller")
+    p_check = sub.add_parser("check", help="collect evidence and diagnose one NVMe or SATA/ATA drive")
     _add_common(p_check)
 
-    p_topology = sub.add_parser("topology", help="show NUMA -> PCIe path -> NVMe namespaces")
-    p_topology.add_argument("device", nargs="?", help="NVMe controller, namespace, or USB-translated block device")
+    p_topology = sub.add_parser("topology", help="show the available host/transport topology for one storage device")
+    p_topology.add_argument("device", nargs="?", help="NVMe controller/namespace or SATA/USB block device")
     p_topology.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     p_topology.add_argument(
         "--direct-usb", action="store_true",
@@ -111,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
     p_watch = sub.add_parser("watch", help="watch counters/findings and report meaningful changes")
-    p_watch.add_argument("device", nargs="?", help="NVMe controller or namespace")
+    p_watch.add_argument("device", nargs="?", help="NVMe controller/namespace or SATA/USB block device")
     p_watch.add_argument("--interval", type=float, default=5.0, help="poll interval in seconds (default: 5)")
     p_watch.add_argument("--count", type=int, default=0, help="number of samples; 0 means until interrupted")
     p_watch.add_argument("--json-lines", action="store_true", help="emit one compact JSON object per changed sample")
@@ -145,23 +156,120 @@ def _watch_key(report_dict: Dict[str, Any]) -> Dict[str, Any]:
         "unsafe_shutdowns": smart.get("unsafe_shutdowns", smart.get("unsafe_shutdown_count")),
         "percentage_used": smart.get("percent_used", smart.get("percentage_used")),
         "temperature": smart.get("temperature", smart.get("composite_temperature")),
+        "reallocated_sectors": smart.get("reallocated_sectors"),
+        "pending_sectors": smart.get("current_pending_sectors"),
+        "offline_uncorrectable": smart.get("offline_uncorrectable"),
+        "udma_crc_errors": smart.get("udma_crc_errors"),
         "aer": pci.get("aer"),
     }
 
 
+def _existing_quick_health(item: Dict[str, Any]) -> Optional[str]:
+    """Map an already-collected OS/SMART status to a compact list health value."""
+    value = item.get("smart_status")
+    if isinstance(value, dict):
+        passed = value.get("passed")
+        if passed is True:
+            return "GOOD"
+        if passed is False:
+            return "FAIL"
+    if isinstance(value, bool):
+        return "GOOD" if value else "FAIL"
+    text = str(value or "").strip().lower()
+    if text in {"verified", "ok", "passed", "pass", "healthy"}:
+        return "GOOD"
+    if any(word in text for word in ("fail", "fatal", "bad")):
+        return "FAIL"
+    return None
+
+
+def _quick_health_from_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "-"
+    status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
+    passed = status.get("passed")
+    nvme = payload.get("nvme_smart_health_information_log")
+    if isinstance(nvme, dict):
+        critical = to_int(nvme.get("critical_warning"))
+        if critical:
+            return "WARN"
+    if passed is False:
+        return "FAIL"
+    if passed is True:
+        return "GOOD"
+    return "-"
+
+
+def _quick_health_probe(item: Dict[str, Any]) -> str:
+    """Non-disruptive, short health probe used only by `list`.
+
+    Direct/capture-style USB access is deliberately never attempted here.
+    """
+    existing = _existing_quick_health(item)
+    if existing:
+        return existing
+
+    transport = str(item.get("transport") or "").lower()
+    protocol = str(item.get("protocol") or "").upper()
+    if protocol not in {"NVME", "ATA"}:
+        return "-"
+
+    # macOS USB NVMe/SATA health may require a translated/direct bridge path,
+    # eject, or capture. `list` must remain non-disruptive and quick.
+    if platform_key() == "darwin" and "usb" in transport:
+        return "-"
+
+    device = str(item.get("device") or "").strip()
+    if not device:
+        return "-"
+
+    dtype = item.get("smartctl_device_type") or item.get("smartctl_type")
+    if not dtype and protocol == "ATA" and platform_key() == "linux" and "usb" not in transport:
+        dtype = "ata"
+
+    argv = ["smartctl"]
+    if dtype:
+        argv += ["-d", str(dtype)]
+    argv += ["-H", "-j", device]
+    res = Runner().run(argv, timeout=1.5)
+    if not res.available or not res.stdout.strip():
+        return "-"
+    return _quick_health_from_payload(read_json(res.stdout))
+
+
+def _add_quick_health(controllers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add compact Health values without serializing per-disk probe latency."""
+    if not controllers:
+        return controllers
+    rows = [dict(item) for item in controllers]
+    workers = min(8, len(rows))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {pool.submit(_quick_health_probe, row): idx for idx, row in enumerate(rows)}
+        for future in as_completed(pending):
+            idx = pending[future]
+            try:
+                rows[idx]["health"] = future.result() or "-"
+            except Exception:
+                rows[idx]["health"] = "-"
+    for row in rows:
+        row.setdefault("health", "-")
+    return rows
+
+
 def command_list(args: argparse.Namespace) -> int:
-    controllers = discover_controllers()
+    controllers = _add_quick_health(discover_controllers())
     if args.json:
         sys.stdout.write(json.dumps(controllers, indent=2) + "\n")
         return EXIT_OK
     if not controllers:
-        print(f"No NVMe devices found by the {platform_label()} backend.")
+        print(f"No supported NVMe/SATA devices found by the {platform_label()} backend.")
         return EXIT_WARNING
-    print(f"{'Controller':<12} {'State':<12} {'Transport':<14} {'Model':<36} {'Firmware':<12} Serial")
+    print(f"{'Controller':<12} {'Health':<7} {'Proto':<6} {'Transport':<14} {'Size':>10}  {'Model':<36} {'Firmware':<12} Serial")
     for item in controllers:
+        size = format_bytes_decimal(item.get('size_bytes')) or '-'
         print(
-            f"{item.get('controller','-'):<12} {str(item.get('state') or '-'):<12} "
-            f"{str(item.get('transport') or '-')[:13]:<14} "
+            f"{item.get('controller','-'):<12} {str(item.get('health') or '-')[:6]:<7} {str(item.get('protocol') or '-')[:5]:<6} "
+            f"{str(item.get('transport') or '-')[:13]:<14} {size:>10}  "
             f"{str(item.get('model') or '-')[:35]:<36} {str(item.get('firmware') or '-'):<12} {item.get('serial') or '-'}"
         )
     return EXIT_OK

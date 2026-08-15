@@ -228,3 +228,94 @@ def test_spinner_cycles_dots(monkeypatch):
     assert b"\rChecking..." in stream
     assert b"\rChecking.  " in stream
     assert stream.endswith(b"\r           \r\x1b[?25h")
+
+
+def test_list_quick_health_maps_smart_pass_fail_and_nvme_warning():
+    import src.cli as cli
+
+    assert cli._quick_health_from_payload({"smart_status": {"passed": True}}) == "GOOD"
+    assert cli._quick_health_from_payload({"smart_status": {"passed": False}}) == "FAIL"
+    assert cli._quick_health_from_payload({
+        "smart_status": {"passed": True},
+        "nvme_smart_health_information_log": {"critical_warning": 1},
+    }) == "WARN"
+    assert cli._quick_health_from_payload({}) == "-"
+
+
+def test_list_quick_health_macos_usb_is_not_disruptively_probed(monkeypatch):
+    import src.cli as cli
+
+    monkeypatch.setattr(cli, "platform_key", lambda: "darwin")
+    row = {
+        "device": "/dev/disk4",
+        "protocol": "NVMe",
+        "transport": "USB -> NVMe",
+        "state": "direct-ready",
+    }
+    assert cli._quick_health_probe(row) == "-"
+
+
+def test_list_quick_health_uses_existing_macos_status_without_probe(monkeypatch):
+    import src.cli as cli
+
+    monkeypatch.setattr(cli, "platform_key", lambda: "darwin")
+    row = {
+        "device": "/dev/disk0",
+        "protocol": "NVMe",
+        "transport": "NVMe",
+        "smart_status": "Verified",
+    }
+    assert cli._quick_health_probe(row) == "GOOD"
+
+
+def test_list_output_has_health_column(monkeypatch, capsys):
+    import argparse
+    import src.cli as cli
+
+    monkeypatch.setattr(cli, "discover_controllers", lambda: [{
+        "controller": "sda",
+        "device": "/dev/sda",
+        "state": "live",
+        "protocol": "ATA",
+        "transport": "SATA",
+        "model": "SOLIDIGM TEST",
+        "firmware": "FW1",
+        "serial": "SER1",
+        "size_bytes": 1_920_000_000_000,
+    }])
+    monkeypatch.setattr(cli, "_add_quick_health", lambda rows: [dict(rows[0], health="GOOD")])
+    assert cli.command_list(argparse.Namespace(json=False)) == 0
+    out = capsys.readouterr().out
+    assert "Health" in out
+    assert "Size" in out
+    assert "State" not in out.splitlines()[0]
+    assert "1.92 TB" in out
+    assert "sda" in out
+    assert "GOOD" in out
+
+
+def test_missing_linux_device_is_hard_error_before_collection(monkeypatch, capsys):
+    import src.cli as cli
+
+    monkeypatch.setattr(cli, "platform_key", lambda: "linux")
+    monkeypatch.setattr(cli.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(
+        cli, "collect_snapshot",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("collector must not run for missing device")),
+    )
+
+    rc = cli.main(["check", "sdb", "--no-progress"])
+    captured = capsys.readouterr()
+    assert rc == cli.EXIT_ERROR
+    assert "device not found: /dev/sdb" in captured.err
+    assert "INCOMPLETE" not in captured.out
+
+
+def test_device_validation_checks_normalized_whole_device(monkeypatch):
+    import src.cli as cli
+
+    seen = []
+    monkeypatch.setattr(cli, "platform_key", lambda: "linux")
+    monkeypatch.setattr(cli.os.path, "exists", lambda path: seen.append(path) or True)
+    assert cli._device_or_error("/dev/sda2") == "/dev/sda2"
+    assert seen == ["/dev/sda"]

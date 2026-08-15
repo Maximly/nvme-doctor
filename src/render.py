@@ -77,12 +77,47 @@ def _data_volume(smart: Dict[str, Any], *keys: str) -> Optional[str]:
     return format_bytes_decimal(total) if total is not None else None
 
 
+def _is_ata(snapshot: Snapshot) -> bool:
+    protocol = str(snapshot.controller_info.get("protocol") or "").strip().lower()
+    return protocol in {"ata", "sata"} or bool(snapshot.capabilities.get("ata_smart"))
+
+
 def _smart_health_summary(snapshot: Snapshot) -> List[str]:
     smart = snapshot.smart or {}
     out: List[str] = []
     if not smart:
         return out
     temp = parse_temperature_c(first(smart, "temperature", "composite_temperature"))
+    if _is_ata(snapshot):
+        passed = smart.get("smart_passed")
+        reserve = first(smart, "reserved_space")
+        reserve_threshold = first(smart, "reserved_space_threshold")
+        reserve_margin = first(smart, "reserved_space_margin")
+        wear = first(smart, "media_wear_indicator")
+        def norm_indicator(value: Any) -> Any:
+            if isinstance(value, (int, float)) and 0 <= value <= 100:
+                return f"{int(value)}/100"
+            return value
+        values = [
+            ("SMART overall", "PASSED" if passed is True else "FAILED" if passed is False else None),
+            ("Temperature", f"{temp}°C" if temp is not None else None),
+            ("Reserved space", norm_indicator(reserve)),
+            ("Reserve threshold", norm_indicator(reserve_threshold)),
+            ("Reserve margin", f"{reserve_margin:+d}" if isinstance(reserve_margin, int) else reserve_margin),
+            ("Reallocated sectors", first(smart, "reallocated_sectors")),
+            ("Pending sectors", first(smart, "current_pending_sectors")),
+            ("Offline uncorrectable", first(smart, "offline_uncorrectable")),
+            ("Reported uncorrectable", first(smart, "reported_uncorrectable")),
+            ("Media wear indicator", norm_indicator(wear)),
+            ("UDMA CRC errors", first(smart, "udma_crc_errors")),
+            ("Command timeouts", first(smart, "command_timeouts")),
+            ("ATA error log", first(smart, "ata_error_count")),
+        ]
+        for label, value in values:
+            if value is not None:
+                out.append(f"  {label:<20} {_v(value)}")
+        return out
+
     values = [
         ("Temperature", f"{temp}°C" if temp is not None else None),
         ("Critical warning", _critical_warning_text(first(smart, "critical_warning", "critical_warning_raw"))),
@@ -98,11 +133,17 @@ def _smart_health_summary(snapshot: Snapshot) -> List[str]:
             out.append(f"  {label:<20} {_v(value)}{suffix}")
     return out
 
-
 def _smart_lifetime_summary(snapshot: Snapshot) -> List[str]:
     smart = snapshot.smart or {}
     if not smart:
         return []
+    if _is_ata(snapshot):
+        values = [
+            ("Power cycles", _count_text(first(smart, "power_cycles"))),
+            ("Power-on hours", _power_on_text(first(smart, "power_on_hours"))),
+        ]
+        return [f"  {label:<20} {_v(value)}" for label, value in values if value is not None]
+
     values = [
         ("Power cycles", _count_text(first(smart, "power_cycles"))),
         ("Power-on hours", _power_on_text(first(smart, "power_on_hours"))),
@@ -115,7 +156,6 @@ def _smart_lifetime_summary(snapshot: Snapshot) -> List[str]:
         ("Warning-temp time", format_duration_minutes(first(smart, "warning_temp_time"))),
         ("Critical-temp time", format_duration_minutes(first(smart, "critical_comp_time"))),
     ]
-    # Thermal Management Temperature 1/2 counters are optional in SMART.
     t1_count = first(smart, "thm_temp1_trans_count", "thermal_mgmt_temp1_transition_count")
     t1_time = first(smart, "thm_temp1_total_time", "thermal_mgmt_temp1_total_time")
     t2_count = first(smart, "thm_temp2_trans_count", "thermal_mgmt_temp2_transition_count")
@@ -132,13 +172,7 @@ def _smart_lifetime_summary(snapshot: Snapshot) -> List[str]:
         if duration:
             text += f", {duration} total"
         values.append(("Thermal mgmt T2", text))
-
-    out: List[str] = []
-    for label, value in values:
-        if value is not None:
-            out.append(f"  {label:<20} {_v(value)}")
-    return out
-
+    return [f"  {label:<20} {_v(value)}" for label, value in values if value is not None]
 
 def _nvme_version(snapshot: Snapshot) -> Optional[str]:
     ci = snapshot.controller_info
@@ -225,6 +259,16 @@ def render_text(report: Report, verbose: bool = False) -> str:
         headline = report.assessment.get("headline")
         if headline:
             lines.append(f"  Conclusion           {headline}")
+        risk = report.assessment.get("near_term_risk")
+        if isinstance(risk, dict):
+            state = str(risk.get("state") or "-")
+            detail = str(risk.get("detail") or "")
+            lines.append(f"  Near-term risk       {state}{(' — ' + detail) if detail else ''}")
+        trend = report.assessment.get("trend")
+        if isinstance(trend, dict):
+            state = str(trend.get("state") or "-")
+            detail = str(trend.get("detail") or "")
+            lines.append(f"  Trend                {state}{(' — ' + detail) if detail else ''}")
         for row in report.assessment.get("domains", []):
             if not isinstance(row, dict):
                 continue
@@ -246,20 +290,42 @@ def render_text(report: Report, verbose: bool = False) -> str:
     lines.append(f"  Model                {_v(ci.get('model'))}")
     lines.append(f"  Serial               {_v(ci.get('serial'))}")
     lines.append(f"  Firmware             {_v(ci.get('firmware_rev'))}")
+    if ci.get("protocol"):
+        lines.append(f"  Protocol             {_v(ci.get('protocol'))}")
     nvme_ver = _nvme_version(s)
     if nvme_ver:
         lines.append(f"  NVMe version         {nvme_ver}")
     capacity = _capacity_text(s)
     if capacity:
-        lines.append(f"  NVM capacity         {capacity}")
+        label = "Capacity" if _is_ata(s) else "NVM capacity"
+        lines.append(f"  {label:<20} {capacity}")
     lines.append(f"  State                {_v(ci.get('state'))}")
     if ci.get("transport"):
         transport = str(ci.get("transport"))
         if ci.get("bus_protocol") and str(ci.get("bus_protocol")).lower() not in transport.lower():
             transport += f" ({ci.get('bus_protocol')})"
         lines.append(f"  Transport            {transport}")
-    if ci.get("smartctl_device_type") and str(ci.get("smartctl_device_type")).lower().startswith("snt"):
-        lines.append(f"  USB bridge backend   {ci.get('smartctl_device_type')}")
+    if _is_ata(s):
+        sata_ver = ci.get("sata_version")
+        if isinstance(sata_ver, dict):
+            sata_ver = sata_ver.get("string") or sata_ver.get("value")
+        if sata_ver:
+            lines.append(f"  SATA version         {_v(sata_ver)}")
+        iface = ci.get("interface_speed")
+        if isinstance(iface, dict):
+            cur = iface.get("current")
+            maxv = iface.get("max")
+            if isinstance(cur, dict):
+                cur = cur.get("string") or cur.get("value")
+            if isinstance(maxv, dict):
+                maxv = maxv.get("string") or maxv.get("value")
+            if cur or maxv:
+                text = _v(cur)
+                if maxv and maxv != cur:
+                    text += f" (max {_v(maxv)})"
+                lines.append(f"  SATA link            {text}")
+    if ci.get("smartctl_device_type") and str(ci.get("smartctl_device_type")).lower().startswith(("snt", "sat")):
+        lines.append(f"  Bridge backend       {ci.get('smartctl_device_type')}")
     usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
     if usb:
         if usb.get("vid_pid"):
@@ -311,7 +377,7 @@ def render_text(report: Report, verbose: bool = False) -> str:
         lines.append("LIFETIME / USAGE")
         lines.extend(lifetime_lines)
 
-    error_lines = _error_history_summary(s)
+    error_lines = [] if _is_ata(s) else _error_history_summary(s)
     if error_lines:
         lines.append("")
         lines.append("RECENT NVME ERROR LOG")
@@ -323,7 +389,7 @@ def render_text(report: Report, verbose: bool = False) -> str:
         if report.status == "INCOMPLETE":
             lines.append("  Diagnostic evidence is incomplete; a clean-health conclusion cannot be made.")
             if s.host.get("euid") not in (None, 0):
-                lines.append(f"  Re-run as root to allow NVMe admin/log-page access: sudo nvme-doctor check {s.controller}")
+                lines.append(f"  Re-run as root to allow SMART/admin access: sudo nvme-doctor check {s.controller}")
         else:
             lines.append("  No high-signal problem was detected from the available evidence.")
     else:
@@ -344,15 +410,24 @@ def render_text(report: Report, verbose: bool = False) -> str:
     if s.host.get("platform") == "darwin" or verbose:
         lines.append("")
         lines.append("CAPABILITIES")
-        labels = [
-            ("NVMe SMART/Health", "nvme_smart"),
-            ("NVMe error log", "nvme_error_log"),
-            ("PCIe link", "pcie_link"),
-            ("PCIe AER", "pcie_aer"),
-            ("PCIe topology", "pcie_topology"),
-            ("Power-state analysis", "power_management"),
-            ("Target-scoped OS log", "targeted_kernel_log"),
-        ]
+        labels = (
+            [
+                ("ATA SMART", "ata_smart"),
+                ("ATA error log", "ata_error_log"),
+                ("ATA self-test log", "ata_self_test_log"),
+                ("SATA link", "sata_link"),
+                ("Target-scoped OS log", "targeted_kernel_log"),
+            ]
+            if _is_ata(s) else [
+                ("NVMe SMART/Health", "nvme_smart"),
+                ("NVMe error log", "nvme_error_log"),
+                ("PCIe link", "pcie_link"),
+                ("PCIe AER", "pcie_aer"),
+                ("PCIe topology", "pcie_topology"),
+                ("Power-state analysis", "power_management"),
+                ("Target-scoped OS log", "targeted_kernel_log"),
+            ]
+        )
         for label, key in labels:
             value = s.capabilities.get(key, False)
             if value is True:
@@ -391,7 +466,7 @@ def render_text(report: Report, verbose: bool = False) -> str:
             "Safety: direct USB mode used read-only NVMe Identify/SMART commands; it temporarily unmounted/captured the enclosure, then restored its original mount state."
         )
     else:
-        lines.append("Safety: NVMe Doctor is diagnostic-only; it does not reset controllers or change OS/storage power settings.")
+        lines.append("Safety: NVMe Doctor is diagnostic-only; SATA/ATA support uses read-only SMART/reporting commands and does not alter drive settings.")
     return "\n".join(lines) + "\n"
 
 
