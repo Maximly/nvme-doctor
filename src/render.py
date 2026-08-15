@@ -260,6 +260,21 @@ def render_text(report: Report, verbose: bool = False) -> str:
         lines.append(f"  Transport            {transport}")
     if ci.get("smartctl_device_type") and str(ci.get("smartctl_device_type")).lower().startswith("snt"):
         lines.append(f"  USB bridge backend   {ci.get('smartctl_device_type')}")
+    usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
+    if usb:
+        if usb.get("vid_pid"):
+            bridge_name = " ".join(str(x) for x in (usb.get("manufacturer"), usb.get("product")) if x).strip()
+            lines.append(f"  USB bridge           {usb.get('vid_pid')}{(' ' + bridge_name) if bridge_name else ''}")
+        if usb.get("usb_port"):
+            lines.append(f"  USB port             {usb.get('usb_port')}")
+        if usb.get("speed_mbps") is not None:
+            ver = f"USB {usb.get('usb_version')}, " if usb.get("usb_version") else ""
+            lines.append(f"  USB link             {ver}{usb.get('speed_mbps')} Mb/s")
+        if usb.get("interface_driver"):
+            lines.append(f"  USB storage driver   {usb.get('interface_driver')}")
+        if usb.get("host_controller_bdf") or usb.get("host_controller_driver"):
+            host = " ".join(str(x) for x in (usb.get("host_controller_bdf"), usb.get("host_controller_driver")) if x)
+            lines.append(f"  USB host             {host}")
     if pci:
         if pci.get("bdf"):
             lines.append(f"  PCI address          {_v(pci.get('bdf'))}")
@@ -373,7 +388,7 @@ def render_text(report: Report, verbose: bool = False) -> str:
     lines.append("")
     if ci.get("direct_usb") and s.capabilities.get("nvme_smart"):
         lines.append(
-            "Safety: direct USB mode used read-only NVMe Identify/SMART commands; it temporarily unmounted/captured the enclosure, then released and remounted it."
+            "Safety: direct USB mode used read-only NVMe Identify/SMART commands; it temporarily unmounted/captured the enclosure, then restored its original mount state."
         )
     else:
         lines.append("Safety: NVMe Doctor is diagnostic-only; it does not reset controllers or change OS/storage power settings.")
@@ -446,11 +461,33 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
     cpus = topology.get("local_cpulist")
     usb_translated = bool(ci.get("native_nvme") is False or ci.get("usb_bridge") or ci.get("usb_bridge_model"))
     if usb_translated:
-        lines.append("Host USB storage path")
+        usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
+        host = "Host USB storage path"
+        if usb.get("host_controller_bdf") or usb.get("host_controller_driver"):
+            host_bits = [usb.get("host_controller_bdf"), usb.get("host_controller_driver")]
+            host = "USB host " + " ".join(str(x) for x in host_bits if x)
+        lines.append(host)
+        port_bits = []
+        if usb.get("usb_port"):
+            port_bits.append(str(usb.get("usb_port")))
+        if usb.get("usb_version"):
+            port_bits.append(f"USB {usb.get('usb_version')}")
+        if usb.get("speed_mbps") is not None:
+            port_bits.append(f"{usb.get('speed_mbps')} Mb/s")
+        if usb.get("interface_driver"):
+            port_bits.append(str(usb.get("interface_driver")))
+        if port_bits:
+            lines.append("└─ " + " — ".join(port_bits))
+            prefix = "   └─ "
+        else:
+            prefix = "└─ "
         bridge = bridge_label or ci.get("usb_bridge_product") or "USB/SCSI bridge"
-        lines.append(f"└─ {bridge}")
+        if usb.get("vid_pid"):
+            hw = " ".join(str(x) for x in (usb.get("manufacturer"), usb.get("product")) if x).strip()
+            bridge = f"{usb.get('vid_pid')}" + (f" {hw}" if hw else f" {bridge}")
+        lines.append(f"{prefix}{bridge}")
         nvme_model = model if model != "-" else "underlying NVMe identity unavailable"
-        lines.append(f"   └─ NVMe SSD — {nvme_model}")
+        lines.append(f"      └─ NVMe SSD — {nvme_model}")
         namespaces = topology.get("namespaces") or []
         if namespaces:
             for idx, ns in enumerate(namespaces):

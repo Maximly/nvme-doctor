@@ -34,9 +34,9 @@ The direct path:
 6. sends RTL9210 vendor SCSI CDB `0xE4` carrying read-only NVMe commands;
 7. reads NVMe Identify Controller (`0x06`, CNS 1);
 8. reads the 512-byte NVMe SMART/Health log (`Get Log Page 0x02`, LID 0x02);
-9. releases the interface, reattaches the macOS storage driver, and remounts the disk.
+9. releases the interface, reattaches the macOS storage driver, and restores the disk's original mount state.
 
-The backend does **not** send format, sanitize, firmware activation, namespace-management, write, reset, or feature-changing commands. The NVMe operations are read-only, but unmount/capture/remount is operationally disruptive, so close applications using the disk first.
+The backend does **not** send format, sanitize, firmware activation, namespace-management, write, reset, or feature-changing commands. The NVMe operations are read-only, but temporary capture/mount-state restoration is operationally disruptive, so close applications using the disk first.
 
 Homebrew libusb is required for this optional path:
 
@@ -63,7 +63,8 @@ The direct implementation is intentionally narrow and conservative:
 - exactly one external physical USB SSD;
 - exactly one RTL9210 bridge;
 - root required;
-- Identify + SMART only.
+- Identify + SMART are the default fast path; Error Information and Firmware Slot logs are opt-in with `--usb-extra-logs` because some RTL9210 firmware revisions reject them slowly.
+- Direct RTL9210 capture performs a whole-disk `diskutil eject` before detaching the macOS USB storage driver, preventing the system “Disk Not Ejected Properly” warning; previously mounted media is re-mounted after the driver re-probes it.
 
 This avoids guessing which bridge belongs to which `diskN` when macOS does not expose a reliable disk-to-USB VID:PID mapping through `diskutil`. Other bridge chipsets remain capability-dependent.
 

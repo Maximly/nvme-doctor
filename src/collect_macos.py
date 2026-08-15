@@ -5,7 +5,7 @@ import os
 import platform
 import plistlib
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .model import Snapshot
 from .runner import Runner
@@ -559,6 +559,11 @@ def _populate_external_usb_snapshot(
     controller: str,
     device_path: str,
     direct_usb: bool,
+    auto_direct_usb: bool = False,
+    direct_usb_mount_state_checked: bool = False,
+    direct_usb_mounts_before: Optional[List[str]] = None,
+    usb_extra_logs: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Populate an external USB SSD snapshot without slow native-NVMe probes."""
     snapshot.controller_info.update({
@@ -575,10 +580,33 @@ def _populate_external_usb_snapshot(
         "smart_status": physical.get("smart_status"),
     })
 
+    if not direct_usb and auto_direct_usb:
+        if progress:
+            progress("Detecting RTL9210 for automatic privileged direct access")
+        try:
+            from .macos_usb_nvme import rtl9210_inventory
+            bridges = rtl9210_inventory(progress=progress)
+        except Exception as exc:
+            bridges = []
+            if progress:
+                progress(f"RTL9210 capability probe failed: {exc}")
+        if len(bridges) == 1:
+            direct_usb = True
+            if progress:
+                progress("RTL9210 detected under sudo: entering direct read-only NVMe mode")
+        elif len(bridges) > 1 and progress:
+            progress(f"{len(bridges)} RTL9210 bridges detected; refusing ambiguous automatic capture")
+
     if direct_usb:
         try:
             from .macos_usb_nvme import read_rtl9210_nvme
-            direct = read_rtl9210_nvme(device_path)
+            direct = read_rtl9210_nvme(
+                device_path,
+                mount_state_checked=direct_usb_mount_state_checked,
+                mounts_before=direct_usb_mounts_before,
+                collect_optional_logs=usb_extra_logs,
+                progress=progress,
+            )
             ident = direct.get("identify") or {}
             bridge = direct.get("bridge") or {}
             snapshot.tools["macos_direct_usb"] = {"bridge": bridge}
@@ -610,11 +638,25 @@ def _populate_external_usb_snapshot(
             if isinstance(smart, dict):
                 snapshot.smart = smart
                 snapshot.capabilities["nvme_smart"] = True
+            error_log = direct.get("error_log")
+            if isinstance(error_log, list):
+                snapshot.error_log = error_log
+                snapshot.capabilities["nvme_error_log"] = True
+            fw_slots = direct.get("firmware_slot_log")
+            if isinstance(fw_slots, dict):
+                snapshot.tools["nvme_firmware_slot_log"] = fw_slots
+            for note in direct.get("optional_log_errors") or []:
+                snapshot.collection_notes.append(f"optional RTL9210 NVMe log unavailable: {note}")
+            detail = "Identify + SMART"
+            if usb_extra_logs:
+                detail += " + optional Error/Firmware Slot logs"
             snapshot.collection_notes.append(
-                "Direct macOS USB mode temporarily unmounted the disk, captured the RTL9210, "
-                "read NVMe Identify + SMART through BOT, then released and remounted it."
+                f"Direct macOS USB mode temporarily acquired the RTL9210, read NVMe {detail} "
+                "through BOT, then restored the original disk mount state."
             )
         except Exception as exc:
+            if progress:
+                progress(f"Direct USB access failed: {exc}")
             snapshot.controller_info["nvme_passthrough"] = False
             snapshot.controller_info["passthrough_reason"] = "direct-usb-failed"
             snapshot.collection_notes.append(f"direct macOS USB NVMe access failed: {exc}")
@@ -623,9 +665,11 @@ def _populate_external_usb_snapshot(
     snapshot.controller_info["nvme_passthrough"] = False
     snapshot.controller_info["passthrough_reason"] = "darwin-no-scsi-passthrough"
     snapshot.collection_notes.append(_darwin_usb_nvme_passthrough_limitation())
+    if progress:
+        progress("Checking direct RTL9210 capability")
     try:
         from .macos_usb_nvme import rtl9210_inventory
-        bridges = rtl9210_inventory()
+        bridges = rtl9210_inventory(progress=progress)
     except Exception:
         bridges = []
     if len(bridges) == 1:
@@ -641,7 +685,7 @@ def _populate_external_usb_snapshot(
             "usb_bridge_product": bridge.get("product"),
         })
         snapshot.collection_notes.append(
-            f"Direct RTL9210 access is available; rerun with `sudo nvme-doctor check {controller} --direct-usb` "
+            f"Direct RTL9210 access is available; rerun with `sudo nvme-doctor check {controller}` "
             "to temporarily unmount/capture the enclosure and read NVMe SMART."
         )
 
@@ -651,6 +695,11 @@ def collect_snapshot_macos(
     runner: Optional[Runner] = None,
     kernel_lines: int = 300,
     direct_usb: bool = False,
+    auto_direct_usb: bool = False,
+    direct_usb_mount_state_checked: bool = False,
+    direct_usb_mounts_before: Optional[List[str]] = None,
+    usb_extra_logs: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Snapshot:
     runner = runner or Runner()
     controller, device_path = normalize_macos_device(requested_device)
@@ -676,10 +725,15 @@ def collect_snapshot_macos(
         "targeted_kernel_log": False,
     }
 
+    if progress:
+        progress(f"Inspecting {device_path} and its storage transport")
+
     # Fast-path external USB SSDs before native-NVMe collectors. system_profiler
     # SPNVMeDataType, smartctl --scan-open and unified-log queries can each take
     # many seconds on macOS and cannot reveal native PCIe/AER/NUMA information
     # through an opaque USB bridge anyway.
+    if progress:
+        progress("Reading disk metadata with diskutil")
     target_physical = _diskutil_target_disk(runner, controller, snapshot.collection_notes)
     if target_physical and target_physical.get("internal") is not True:
         bus = str(target_physical.get("bus_protocol") or "").lower()
@@ -690,9 +744,18 @@ def collect_snapshot_macos(
                 controller=controller,
                 device_path=device_path,
                 direct_usb=direct_usb,
+                auto_direct_usb=auto_direct_usb,
+                direct_usb_mount_state_checked=direct_usb_mount_state_checked,
+                direct_usb_mounts_before=direct_usb_mounts_before,
+                usb_extra_logs=usb_extra_logs,
+                progress=progress,
             )
+            if progress:
+                progress("Evidence collection complete")
             return snapshot
 
+    if progress:
+        progress("Checking native NVMe inventory with system_profiler")
     profiler_items = _system_profiler_nvme(runner, snapshot.collection_notes)
     profiler_item = next((x for x in profiler_items if str(x.get("bsd_name")) == controller), None)
     if profiler_item:
@@ -709,6 +772,8 @@ def collect_snapshot_macos(
             snapshot.pci["source"] = "system_profiler"
             snapshot.capabilities["pcie_link"] = "partial"
         else:
+            if progress:
+                progress("Reading native NVMe link details")
             text_link = _system_profiler_link_text(runner, controller)
             if text_link:
                 snapshot.pci = dict(text_link)
@@ -718,6 +783,8 @@ def collect_snapshot_macos(
         snapshot.controller_info.update({"state": "unknown", "backend": "macos"})
         snapshot.collection_notes.append(f"{device_path} was not found in system_profiler SPNVMeDataType")
 
+    if progress:
+        progress("Scanning smartctl NVMe/bridge backends")
     scan, scan_note = _smartctl_scan(runner)
     if scan_note:
         snapshot.collection_notes.append(scan_note)
@@ -734,6 +801,8 @@ def collect_snapshot_macos(
     # scan.  If diskutil proves this is an external physical disk, try the
     # supported NVMe-over-SCSI translation backends before giving up.
     if not scan_item and not profiler_item:
+        if progress:
+            progress("Enumerating physical disks with diskutil")
         physical = next((x for x in _diskutil_physical_disks(runner, snapshot.collection_notes) if x.get("device") == device_path), None)
         if physical and physical.get("internal") is not True:
             bus = str(physical.get("bus_protocol") or "").lower()
@@ -757,7 +826,13 @@ def collect_snapshot_macos(
                 if direct_usb:
                     try:
                         from .macos_usb_nvme import read_rtl9210_nvme
-                        direct = read_rtl9210_nvme(device_path)
+                        direct = read_rtl9210_nvme(
+                            device_path,
+                            mount_state_checked=direct_usb_mount_state_checked,
+                            mounts_before=direct_usb_mounts_before,
+                            collect_optional_logs=usb_extra_logs,
+                            progress=progress,
+                        )
                         ident = direct.get("identify") or {}
                         bridge = direct.get("bridge") or {}
                         snapshot.tools["macos_direct_usb"] = {"bridge": bridge}
@@ -787,9 +862,21 @@ def collect_snapshot_macos(
                         if isinstance(smart, dict):
                             snapshot.smart = smart
                             snapshot.capabilities["nvme_smart"] = True
+                        error_log = direct.get("error_log")
+                        if isinstance(error_log, list):
+                            snapshot.error_log = error_log
+                            snapshot.capabilities["nvme_error_log"] = True
+                        fw_slots = direct.get("firmware_slot_log")
+                        if isinstance(fw_slots, dict):
+                            snapshot.tools["nvme_firmware_slot_log"] = fw_slots
+                        for note in direct.get("optional_log_errors") or []:
+                            snapshot.collection_notes.append(f"optional RTL9210 NVMe log unavailable: {note}")
+                        detail = "Identify + SMART"
+                        if usb_extra_logs:
+                            detail += " + optional Error/Firmware Slot logs"
                         snapshot.collection_notes.append(
-                            "Direct macOS USB mode temporarily unmounted the disk, captured the RTL9210, "
-                            "read NVMe Identify + SMART through BOT, then released and remounted it."
+                            f"Direct macOS USB mode temporarily acquired the RTL9210, read NVMe {detail} "
+                            "through BOT, then restored the original disk mount state."
                         )
                     except Exception as exc:
                         snapshot.controller_info["nvme_passthrough"] = False
@@ -799,9 +886,11 @@ def collect_snapshot_macos(
                     snapshot.controller_info["nvme_passthrough"] = False
                     snapshot.controller_info["passthrough_reason"] = "darwin-no-scsi-passthrough"
                     snapshot.collection_notes.append(_darwin_usb_nvme_passthrough_limitation())
+                    if progress:
+                        progress("Checking direct RTL9210 capability")
                     try:
                         from .macos_usb_nvme import rtl9210_inventory
-                        bridges = rtl9210_inventory()
+                        bridges = rtl9210_inventory(progress=progress)
                     except Exception:
                         bridges = []
                     if len(bridges) == 1:
@@ -813,7 +902,7 @@ def collect_snapshot_macos(
                             "usb_vid_pid": "0bda:9210",
                         })
                         snapshot.collection_notes.append(
-                            f"Direct RTL9210 access is available; rerun with `sudo nvme-doctor check {controller} --direct-usb` "
+                            f"Direct RTL9210 access is available; rerun with `sudo nvme-doctor check {controller}` "
                             "to temporarily unmount/capture the enclosure and read NVMe SMART."
                         )
 
@@ -824,6 +913,8 @@ def collect_snapshot_macos(
     smartctl = None
     if not snapshot.controller_info.get("direct_usb") or not snapshot.capabilities.get("nvme_smart"):
         if profiler_item or scan_item or snapshot.controller_info.get("nvme_passthrough") is not False:
+            if progress:
+                progress("Reading SMART / NVMe health data")
             smartctl = _smartctl_json(runner, smartctl_device or device_path, device_type, snapshot.collection_notes)
     if isinstance(smartctl, dict):
         snapshot.tools["smartctl"] = smartctl
@@ -846,10 +937,14 @@ def collect_snapshot_macos(
         snapshot.controller_info.get("serial"),
         snapshot.controller_info.get("model"),
     ]
+    if progress:
+        progress("Collecting target-scoped macOS storage events")
     log_lines = _macos_log(runner, identity_tokens, max(20, kernel_lines))
     if log_lines:
         snapshot.kernel_lines = log_lines
         snapshot.capabilities["targeted_kernel_log"] = True
 
     snapshot.collection_notes = list(dict.fromkeys(snapshot.collection_notes))
+    if progress:
+        progress("Evidence collection complete")
     return snapshot

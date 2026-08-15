@@ -415,7 +415,7 @@ def test_macos_check_opaque_usb_ssd_is_incomplete_and_explains_passthrough():
 def test_macos_direct_usb_check_uses_underlying_nvme(monkeypatch):
     import src.macos_usb_nvme as direct_mod
 
-    monkeypatch.setattr(direct_mod, "read_rtl9210_nvme", lambda device: {
+    monkeypatch.setattr(direct_mod, "read_rtl9210_nvme", lambda device, **kwargs: {
         "bridge": {
             "vendor_id": 0x0BDA,
             "product_id": 0x9210,

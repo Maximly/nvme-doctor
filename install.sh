@@ -18,6 +18,7 @@ case "$ACTION" in
     install -d "$BINDIR"
     install -m 0755 "$BUILD_DIR/nvme-doctor" "$CMD"
     printf 'Installed nvme-doctor to %s\n' "$CMD"
+    "$CMD" --version
     ;;
   remove|uninstall)
     rm -f "$CMD"

@@ -5,7 +5,7 @@ import os
 import platform
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .model import Snapshot
 from .runner import Runner
@@ -111,6 +111,113 @@ def _smartctl_scan_candidates_linux(runner: Runner) -> Dict[str, Dict[str, Any]]
     return out
 
 
+
+def _smartctl_args_linux(device: str, *, mode: str, device_type: Optional[str] = None) -> List[str]:
+    """Build one smartctl command while preserving a scan-discovered bridge backend."""
+    argv = ["smartctl"]
+    if device_type:
+        argv += ["-d", str(device_type)]
+    argv += [mode, "-j", device]
+    return argv
+
+
+def _smartctl_candidate_linux(runner: Runner, device: str) -> Dict[str, Any]:
+    return dict(_smartctl_scan_candidates_linux(runner).get(device) or {})
+
+
+def _driver_name(path: Path) -> Optional[str]:
+    try:
+        return (path / "driver").resolve(strict=True).name
+    except OSError:
+        return None
+
+
+def _collect_usb_path_linux(controller: str, sys_class_block: Path = SYS_CLASS_BLOCK) -> Dict[str, Any]:
+    """Describe the host-visible USB/SCSI path for a translated block disk.
+
+    The underlying NVMe PCIe endpoint remains hidden by the bridge, but Linux
+    sysfs exposes enough USB/SCSI ancestry to correlate cable/port/UAS resets.
+    """
+    block = sys_class_block / controller
+    try:
+        leaf = (block / "device").resolve(strict=True)
+    except OSError:
+        return {}
+
+    chain = [leaf, *leaf.parents]
+    usb_dev = None
+    usb_iface = None
+    scsi_host = None
+    scsi_target = None
+    scsi_lun = None
+    pci_host = None
+
+    for node in chain:
+        name = node.name
+        if scsi_host is None and re.fullmatch(r"host\d+", name):
+            scsi_host = name
+        if scsi_target is None and re.fullmatch(r"target\d+:\d+:\d+", name):
+            scsi_target = name
+        if scsi_lun is None and re.fullmatch(r"\d+:\d+:\d+:\d+", name):
+            scsi_lun = name
+        if usb_iface is None and re.fullmatch(r"\d+-[\d.]+:\d+\.\d+", name):
+            usb_iface = node
+        if usb_dev is None and (node / "idVendor").exists() and (node / "idProduct").exists():
+            usb_dev = node
+        if pci_host is None and re.fullmatch(r"(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", name):
+            pci_host = node
+
+    if usb_dev is None:
+        return {
+            "sysfs_device": str(leaf),
+            "scsi_host": scsi_host,
+            "scsi_target": scsi_target,
+            "scsi_lun": scsi_lun,
+        }
+
+    speed_raw = read_text(usb_dev / "speed")
+    speed_mbps: Any = speed_raw
+    if speed_raw is not None:
+        try:
+            speed_num = float(speed_raw)
+            speed_mbps = int(speed_num) if speed_num.is_integer() else speed_num
+        except ValueError:
+            pass
+
+    iface_driver = _driver_name(usb_iface) if usb_iface else None
+    host_driver = _driver_name(pci_host) if pci_host else None
+    vid = read_text(usb_dev / "idVendor")
+    pid = read_text(usb_dev / "idProduct")
+    port = usb_dev.name
+
+    tokens = [controller, port, scsi_host, scsi_target, scsi_lun]
+    if vid and pid:
+        tokens += [f"{vid}:{pid}", vid, pid]
+
+    return {
+        "sysfs_device": str(leaf),
+        "usb_port": port,
+        "vendor_id": vid,
+        "product_id": pid,
+        "vid_pid": f"{vid}:{pid}" if vid and pid else None,
+        "manufacturer": read_text(usb_dev / "manufacturer"),
+        "product": read_text(usb_dev / "product"),
+        "serial": read_text(usb_dev / "serial"),
+        "usb_version": read_text(usb_dev / "version"),
+        "device_release": read_text(usb_dev / "bcdDevice"),
+        "speed_mbps": speed_mbps,
+        "busnum": read_text(usb_dev / "busnum"),
+        "devnum": read_text(usb_dev / "devnum"),
+        "interface_driver": iface_driver,
+        "scsi_host": scsi_host,
+        "scsi_target": scsi_target,
+        "scsi_lun": scsi_lun,
+        "host_controller_bdf": pci_host.name if pci_host else None,
+        "host_controller_driver": host_driver,
+        "kernel_tokens": [str(x) for x in tokens if x],
+    }
+
+
 def _usb_solid_state_candidates_linux(sys_class_block: Path = SYS_CLASS_BLOCK) -> Dict[str, Dict[str, Any]]:
     """Find USB whole-disk sdX devices that look solid-state from sysfs.
 
@@ -171,7 +278,8 @@ def discover_controllers_linux(
         # Identification is intentionally cheap; full SMART is collected only
         # by `check`.  smartctl may return non-zero status bits while still
         # producing valid JSON, so parse stdout regardless of return code.
-        probe = runner.run(["smartctl", "-i", "-j", device], timeout=10.0)
+        device_type = candidate.get("device_type")
+        probe = runner.run(_smartctl_args_linux(device, mode="-i", device_type=device_type), timeout=10.0)
         payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
         if _smartctl_json_is_nvme(payload):
             ident = _smartctl_identity(payload)
@@ -186,6 +294,7 @@ def discover_controllers_linux(
                 "smartctl_device_type": ident.get("smartctl_device_type") or candidate.get("device_type"),
                 "protocol": "NVMe",
                 "native_nvme": False,
+                "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block),
             })
             continue
 
@@ -203,6 +312,7 @@ def discover_controllers_linux(
                 "smartctl_device_type": candidate.get("device_type"),
                 "protocol": "NVMe",
                 "native_nvme": False,
+                "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block),
                 "probe_note": "NVMe bridge detected; run list/check as root for identity/health access",
             })
             continue
@@ -219,6 +329,7 @@ def discover_controllers_linux(
                 "state": "probe-needed",
                 "transport": "USB SSD (NVMe unverified)",
                 "native_nvme": False,
+                "usb_path": _collect_usb_path_linux(Path(device).name, sys_class_block),
                 "probe_note": "protocol could not be identified without SMART access; rerun with sudo",
             })
 
@@ -480,13 +591,18 @@ def collect_topology_linux(
     if not _is_native_linux_nvme(controller):
         block = sys_class_block / controller
         bridge_candidate = _usb_solid_state_candidates_linux(sys_class_block).get(device_path, {})
+        scan_candidate = _smartctl_candidate_linux(runner, device_path)
+        device_type = scan_candidate.get("device_type")
+        usb_path = _collect_usb_path_linux(controller, sys_class_block)
         ci: Dict[str, Any] = {
             "state": "present" if block.exists() else "missing",
             "transport": "USB/SCSI -> NVMe",
             "native_nvme": False,
             "usb_bridge_model": bridge_candidate.get("bridge_model"),
+            "smartctl_device_type": device_type,
+            "usb_path": usb_path,
         }
-        probe = runner.run(["smartctl", "-i", "-j", device_path], timeout=4.0)
+        probe = runner.run(_smartctl_args_linux(device_path, mode="-i", device_type=device_type), timeout=4.0)
         payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
         if _smartctl_json_is_nvme(payload):
             ident = _smartctl_identity(payload)
@@ -637,7 +753,13 @@ def collect_topology(
         }
     raise ValueError(f"unsupported operating system: {key}")
 
-def _kernel_log(runner: Runner, controller: str, bdfs: List[str], max_lines: int) -> List[str]:
+def _kernel_log(
+    runner: Runner,
+    controller: str,
+    bdfs: List[str],
+    max_lines: int,
+    extra_tokens: Optional[List[str]] = None,
+) -> List[str]:
     candidates = [
         ["journalctl", "-k", "-b", "--no-pager", "-o", "short-monotonic"],
         ["dmesg", "--color=never", "--ctime"],
@@ -660,6 +782,7 @@ def _kernel_log(runner: Runner, controller: str, bdfs: List[str], max_lines: int
         if low.startswith("0000:"):
             bdf_tokens.add(low[5:])
 
+    token_set = {str(x).strip().lower() for x in (extra_tokens or []) if str(x).strip()}
     selected: List[str] = []
     for line in text.splitlines():
         lower = line.lower()
@@ -667,6 +790,9 @@ def _kernel_log(runner: Runner, controller: str, bdfs: List[str], max_lines: int
             selected.append(line)
             continue
         if any(token in lower for token in bdf_tokens):
+            selected.append(line)
+            continue
+        if any(token in lower for token in token_set):
             selected.append(line)
     return selected[-max_lines:]
 
@@ -717,6 +843,8 @@ def collect_snapshot_linux(
     sys_class_nvme: Path = SYS_CLASS_NVME,
     sys_pci: Path = SYS_PCI,
     kernel_lines: int = 300,
+    sys_class_block: Path = SYS_CLASS_BLOCK,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Snapshot:
     runner = runner or Runner()
     controller, device_path = normalize_device(requested_device)
@@ -732,6 +860,9 @@ def collect_snapshot_linux(
         "euid": os.geteuid() if hasattr(os, "geteuid") else None,
         "os_release": _os_release(),
     }
+    if progress:
+        progress(f"Inspecting {device_path} and its storage transport")
+
     snapshot.capabilities = {
         "nvme_smart": False,
         "nvme_error_log": False,
@@ -747,15 +878,26 @@ def collect_snapshot_linux(
         # USB/SCSI-translated NVMe appears as /dev/sdX. nvme-cli and native
         # NVMe sysfs cannot address that path, but smartctl can on Linux when
         # the bridge supports NVMe admin passthrough (as proven by smartctl -a).
+        if progress:
+            progress("Detecting translated NVMe / USB bridge backend")
+        scan_candidate = _smartctl_candidate_linux(runner, device_path)
+        device_type = scan_candidate.get("device_type")
+        if progress:
+            progress("Reading USB/SCSI path from sysfs")
+        usb_path = _collect_usb_path_linux(controller, sys_class_block)
         snapshot.controller_info.update({
             "state": "present",
-            "sysfs_present": (SYS_CLASS_BLOCK / controller).exists(),
+            "sysfs_present": (sys_class_block / controller).exists(),
             "transport": "USB/SCSI -> NVMe",
             "native_nvme": False,
+            "smartctl_device_type": device_type,
+            "usb_path": usb_path,
         })
+        if progress:
+            progress("Reading NVMe identity and health through smartctl")
         smartctl = _read_tool_json(
             runner,
-            ["smartctl", "-a", "-j", device_path],
+            _smartctl_args_linux(device_path, mode="-a", device_type=device_type),
             snapshot.collection_notes,
             accept_json_on_nonzero=True,
         )
@@ -778,10 +920,22 @@ def collect_snapshot_linux(
         # Keep kernel evidence scoped to the block-device name.  This can catch
         # USB/SCSI resets/disconnects even though the native NVMe PCIe BDF is
         # intentionally unavailable through the bridge.
-        snapshot.kernel_lines = _kernel_log(runner, controller, [], kernel_lines)
+        if progress:
+            progress("Collecting target-scoped OS/kernel events")
+        snapshot.kernel_lines = _kernel_log(
+            runner,
+            controller,
+            [],
+            kernel_lines,
+            extra_tokens=(usb_path.get("kernel_tokens") if isinstance(usb_path, dict) else None),
+        )
         snapshot.collection_notes = list(dict.fromkeys(snapshot.collection_notes))
+        if progress:
+            progress("Evidence collection complete")
         return snapshot
 
+    if progress:
+        progress("Reading native NVMe sysfs and PCIe topology")
     controller_path = sys_class_nvme / controller
     if controller_path.exists():
         snapshot.controller_info.update(_collect_controller_sysfs(controller_path))
@@ -796,11 +950,15 @@ def collect_snapshot_linux(
     snapshot.power = _collect_power()
 
     # nvme-cli is the preferred source for standards-defined controller data.
+    if progress:
+        progress("Reading NVMe SMART / Health log")
     smart = _read_tool_json(runner, ["nvme", "smart-log", device_path, "-o", "json"], snapshot.collection_notes)
     if isinstance(smart, dict):
         snapshot.smart = smart
         snapshot.capabilities["nvme_smart"] = True
 
+    if progress:
+        progress("Reading NVMe Identify Controller")
     ctrl = _read_tool_json(runner, ["nvme", "id-ctrl", device_path, "-o", "json"], snapshot.collection_notes)
     if isinstance(ctrl, dict):
         snapshot.controller_info["nvme_id_ctrl"] = ctrl
@@ -810,6 +968,8 @@ def collect_snapshot_linux(
             if ctrl.get(key) is not None:
                 snapshot.controller_info[key] = ctrl.get(key)
 
+    if progress:
+        progress("Reading NVMe Error Information log")
     errors = _read_tool_json(
         runner,
         ["nvme", "error-log", device_path, "-e", "64", "-o", "json"],
@@ -820,6 +980,8 @@ def collect_snapshot_linux(
         snapshot.capabilities["nvme_error_log"] = True
 
     # smartctl is supplemental for native NVMe and fallback health evidence.
+    if progress:
+        progress("Reading supplemental SMART/identity data")
     smartctl = _read_tool_json(
         runner,
         ["smartctl", "-a", "-j", device_path],
@@ -840,6 +1002,8 @@ def collect_snapshot_linux(
             )
 
     if bdf:
+        if progress:
+            progress("Reading detailed PCIe link/controller data")
         lspci = runner.run(["lspci", "-vv", "-s", bdf], timeout=8.0)
         if lspci.available and lspci.returncode == 0:
             snapshot.tools["lspci"] = lspci.stdout
@@ -849,8 +1013,12 @@ def collect_snapshot_linux(
     relevant_bdfs = [node.get("bdf") for node in snapshot.topology if node.get("bdf")]
     if bdf and bdf not in relevant_bdfs:
         relevant_bdfs.append(bdf)
+    if progress:
+        progress("Collecting target-scoped OS/kernel events")
     snapshot.kernel_lines = _kernel_log(runner, controller, relevant_bdfs, kernel_lines)
     snapshot.collection_notes = list(dict.fromkeys(snapshot.collection_notes))
+    if progress:
+        progress("Evidence collection complete")
     return snapshot
 
 
@@ -876,16 +1044,24 @@ def collect_snapshot(
     kernel_lines: int = 300,
     platform_name: Optional[str] = None,
     direct_usb: bool = False,
+    auto_direct_usb: bool = False,
+    direct_usb_mount_state_checked: bool = False,
+    direct_usb_mounts_before: Optional[List[str]] = None,
+    usb_extra_logs: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Snapshot:
     key = platform_key(platform_name)
     if key == "darwin":
         from .collect_macos import collect_snapshot_macos
         return collect_snapshot_macos(
-            requested_device, runner=runner, kernel_lines=kernel_lines, direct_usb=direct_usb
+            requested_device, runner=runner, kernel_lines=kernel_lines, direct_usb=direct_usb,
+            auto_direct_usb=auto_direct_usb, direct_usb_mount_state_checked=direct_usb_mount_state_checked,
+            direct_usb_mounts_before=direct_usb_mounts_before, usb_extra_logs=usb_extra_logs,
+            progress=progress,
         )
     if key == "linux":
         return collect_snapshot_linux(
             requested_device, runner=runner, sys_class_nvme=sys_class_nvme,
-            sys_pci=sys_pci, kernel_lines=kernel_lines
+            sys_pci=sys_pci, kernel_lines=kernel_lines, progress=progress
         )
     raise ValueError(f"unsupported operating system: {key}")

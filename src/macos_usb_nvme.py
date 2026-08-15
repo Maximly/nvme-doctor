@@ -10,7 +10,7 @@ import re
 import struct
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 USB_CLASS_MASS_STORAGE = 0x08
 USB_PROTOCOL_BOT = 0x50
@@ -21,7 +21,8 @@ LIBUSB_ERROR_NOT_FOUND = -5
 
 BOT_CBW_SIGNATURE = 0x43425355
 BOT_CSW_SIGNATURE = 0x53425355
-USB_TIMEOUT_MS = 7000
+USB_TIMEOUT_MS = 2000
+USB_OPTIONAL_TIMEOUT_MS = 500
 
 RTL9210_VID = 0x0BDA
 RTL9210_PID = 0x9210
@@ -29,9 +30,27 @@ RTL9210_SCSI_OPCODE = 0xE4
 NVME_ADMIN_GET_LOG_PAGE = 0x02
 NVME_ADMIN_IDENTIFY = 0x06
 NVME_IDENTIFY_CNS_CONTROLLER = 0x01
+NVME_ERROR_LOG_ID = 0x01
 NVME_SMART_LOG_ID = 0x02
+NVME_FW_SLOT_LOG_ID = 0x03
 NVME_IDENTIFY_LEN = 4096
 NVME_SMART_LEN = 512
+NVME_ERROR_LOG_LEN = 4096
+NVME_FW_SLOT_LOG_LEN = 512
+
+
+
+ProgressCallback = Optional[Callable[[str], None]]
+
+
+def _progress(callback: ProgressCallback, message: str) -> None:
+    if callback is None:
+        return
+    try:
+        callback(message)
+    except Exception:
+        # Progress reporting must never affect diagnostics or device recovery.
+        pass
 
 ERR_NAMES = {
     0: "SUCCESS", -1: "IO", -2: "INVALID_PARAM", -3: "ACCESS", -4: "NO_DEVICE",
@@ -373,7 +392,7 @@ def _enumerate_rtl9210(lib: ctypes.CDLL, ctx: c_void_p) -> List[Dict[str, Any]]:
     return out
 
 
-def rtl9210_inventory() -> List[Dict[str, Any]]:
+def rtl9210_inventory(progress: ProgressCallback = None) -> List[Dict[str, Any]]:
     """Non-disruptive enumeration of connected RTL9210 mass-storage bridges."""
     lib, path = _load_libusb()
     if not lib:
@@ -385,6 +404,7 @@ def rtl9210_inventory() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     devices: List[Dict[str, Any]] = []
     try:
+        _progress(progress, "Finding the RTL9210 USB bridge")
         devices = _enumerate_rtl9210(lib, ctx)
         for item in devices:
             rows.append({
@@ -410,34 +430,44 @@ def _bulk(lib: ctypes.CDLL, handle: c_void_p, endpoint: int, data: bytearray, ti
     return int(rc), int(transferred.value)
 
 
-def _bot_scsi_read(lib: ctypes.CDLL, handle: c_void_p, bot: Dict[str, Any], cdb: bytes, data_len: int, tag: int) -> bytes:
+def _bot_scsi_read(lib: ctypes.CDLL, handle: c_void_p, bot: Dict[str, Any], cdb: bytes, data_len: int, tag: int, timeout_ms: int = USB_TIMEOUT_MS) -> bytes:
     cdb_padded = cdb + bytes(16 - len(cdb))
     cbw = struct.pack("<IIIBBB16s", BOT_CBW_SIGNATURE, tag, data_len, 0x80, 0, len(cdb), cdb_padded)
     buf = bytearray(cbw)
-    rc, n = _bulk(lib, handle, bot["bulk_out"], buf, USB_TIMEOUT_MS)
+    rc, n = _bulk(lib, handle, bot["bulk_out"], buf, timeout_ms)
     if rc != 0 or n != 31:
         raise RuntimeError(f"BOT CBW failed: {_err(rc)}, transferred {n}/31")
     data = bytearray(data_len)
-    rc, n_data = _bulk(lib, handle, bot["bulk_in"], data, USB_TIMEOUT_MS)
+    rc, n_data = _bulk(lib, handle, bot["bulk_in"], data, timeout_ms)
     if rc != 0:
         raise RuntimeError(f"BOT data read failed: {_err(rc)}, transferred {n_data}/{data_len}")
     csw = bytearray(13)
-    rc, n_csw = _bulk(lib, handle, bot["bulk_in"], csw, USB_TIMEOUT_MS)
+    rc, n_csw = _bulk(lib, handle, bot["bulk_in"], csw, timeout_ms)
     if rc != 0 or n_csw != 13:
         raise RuntimeError(f"BOT CSW failed: {_err(rc)}, transferred {n_csw}/13")
     sig, csw_tag, residue, status = struct.unpack("<IIIB", bytes(csw))
-    if sig != BOT_CSW_SIGNATURE or csw_tag != tag or status != 0:
-        raise RuntimeError(f"BOT command failed: signature=0x{sig:08x}, tag=0x{csw_tag:08x}, status={status}, residue={residue}")
+    if sig != BOT_CSW_SIGNATURE:
+        raise RuntimeError(f"BOT command failed: invalid CSW signature 0x{sig:08x}")
+    if csw_tag != tag:
+        raise RuntimeError(f"BOT command failed: CSW tag 0x{csw_tag:08x} != CBW tag 0x{tag:08x}")
+    if status != 0:
+        raise RuntimeError(f"BOT command failed: status={status}, residue={residue}")
+    expected_residue = max(0, data_len - n_data)
+    if residue != expected_residue:
+        raise RuntimeError(
+            f"BOT transfer accounting mismatch: data={n_data}/{data_len}, residue={residue}, "
+            f"expected residue={expected_residue}"
+        )
     return bytes(data[:n_data])
 
 
-def _rtl_read(lib: ctypes.CDLL, handle: c_void_p, bot: Dict[str, Any], opcode: int, cdw10_low: int, size: int, tag: int) -> bytes:
+def _rtl_read(lib: ctypes.CDLL, handle: c_void_p, bot: Dict[str, Any], opcode: int, cdw10_low: int, size: int, tag: int, timeout_ms: int = USB_TIMEOUT_MS) -> bytes:
     cdb = bytearray(16)
     cdb[0] = RTL9210_SCSI_OPCODE
     struct.pack_into("<H", cdb, 1, size)
     cdb[3] = opcode
     cdb[4] = cdw10_low
-    return _bot_scsi_read(lib, handle, bot, bytes(cdb), size, tag)
+    return _bot_scsi_read(lib, handle, bot, bytes(cdb), size, tag, timeout_ms=timeout_ms)
 
 
 def _ascii(raw: bytes, start: int, length: int) -> str:
@@ -503,20 +533,78 @@ def parse_smart_log(raw: bytes) -> Dict[str, Any]:
     return smart
 
 
-def read_rtl9210_nvme(device: str) -> Dict[str, Any]:
-    """Temporarily unmount/capture one RTL9210 and return read-only NVMe identity/SMART.
 
-    This is intentionally explicit/disruptive: the caller must request direct USB
-    mode.  If more than one RTL9210 is connected, refuse rather than risk selecting
-    the wrong enclosure because diskutil does not expose a stable VID:PID mapping.
+def parse_error_log(raw: bytes) -> List[Dict[str, Any]]:
+    """Parse NVMe Error Information Log entries (64 bytes each)."""
+    out: List[Dict[str, Any]] = []
+    for off in range(0, len(raw) - 63, 64):
+        error_count = struct.unpack_from("<Q", raw, off)[0]
+        if error_count == 0:
+            continue
+        entry = {
+            "error_count": error_count,
+            "sqid": struct.unpack_from("<H", raw, off + 8)[0],
+            "cmdid": struct.unpack_from("<H", raw, off + 10)[0],
+            "status_field": struct.unpack_from("<H", raw, off + 12)[0],
+            "parm_error_location": struct.unpack_from("<H", raw, off + 14)[0],
+            "lba": struct.unpack_from("<Q", raw, off + 16)[0],
+            "nsid": struct.unpack_from("<I", raw, off + 24)[0],
+            "vs": raw[off + 28],
+            "trtype": raw[off + 29],
+        }
+        out.append(entry)
+    return out
+
+
+def parse_firmware_slot_log(raw: bytes) -> Dict[str, Any]:
+    if len(raw) < 64:
+        raise RuntimeError(f"short NVMe Firmware Slot Information response: {len(raw)} bytes")
+    afi = raw[0]
+    slots = []
+    for slot in range(1, 8):
+        off = 8 + (slot - 1) * 8
+        rev = _ascii(raw, off, 8)
+        if rev:
+            slots.append({"slot": slot, "firmware_rev": rev})
+    return {
+        "active_slot": afi & 0x07,
+        "next_active_slot": (afi >> 4) & 0x07,
+        "slots": slots,
+    }
+
+
+def read_rtl9210_nvme(
+    device: str,
+    *,
+    mount_state_checked: bool = False,
+    mounts_before: Optional[List[str]] = None,
+    collect_optional_logs: bool = False,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    """Temporarily capture one RTL9210 and return read-only NVMe identity/SMART.
+
+    Fast path rules:
+    - when the caller already checked mount state, reuse it instead of invoking
+      diskutil list/APFS list again;
+    - always issue a whole-disk `diskutil eject` before detaching the macOS USB
+      storage driver.  A plain unmount is not sufficient: detaching the driver
+      while the media is still logically present makes macOS report “Disk Not
+      Ejected Properly”;
+    - Identify + SMART are the normal health check. Error/Firmware Slot logs are
+      optional because some RTL9210 firmware revisions stall before rejecting them.
+
+    If more than one RTL9210 is connected, refuse rather than risk selecting the
+    wrong enclosure because diskutil does not expose a stable VID:PID mapping.
     """
     if os.geteuid() != 0:
         raise PermissionError("direct macOS USB NVMe access requires root (sudo)")
     disk = _normalize_disk(device)
+    _progress(progress, f"Validating /dev/{disk} with diskutil")
     info = _diskutil_info(disk)  # prove target exists before capture
     bus = str(info.get("BusProtocol") or info.get("Protocol") or "").lower()
     if "usb" not in bus or info.get("Internal") is True:
         raise RuntimeError(f"/dev/{disk} is not an external USB disk")
+    _progress(progress, "Verifying external USB SSD mapping")
     external_ssds = _external_usb_ssds()
     if disk not in external_ssds:
         raise RuntimeError(f"/dev/{disk} is not confirmed as an external physical USB SSD")
@@ -525,24 +613,56 @@ def read_rtl9210_nvme(device: str) -> Dict[str, Any]:
             f"{len(external_ssds)} external USB SSDs are connected ({', '.join(external_ssds)}); "
             "direct mode refuses ambiguous disk-to-bridge mapping"
         )
+    _progress(progress, "Loading libusb")
     lib, libpath = _load_libusb()
     if not lib:
         raise RuntimeError("libusb is required for direct RTL9210 access (Homebrew: `brew install libusb`)")
     _setup(lib)
     ctx = c_void_p()
+    _progress(progress, "Initializing USB access")
     rc = lib.libusb_init(byref(ctx))
     if rc != 0:
         raise RuntimeError(f"libusb_init failed: {_err(rc)}")
 
+    if not mount_state_checked:
+        _progress(progress, "Checking current mount state")
+        mounts_before = mounted_volumes(disk)
+    else:
+        _progress(progress, "Using cached mount state")
+    # If mount state is known-empty, preserve that state. If it is unknown,
+    # retain the historical safe behavior of remounting after a successful unmount.
+    should_remount = mounts_before != []
+
     devices: List[Dict[str, Any]] = []
     handle = None
-    claimed = detached = unmounted = False
+    claimed = detached = unmounted = ejected = False
     iface_num = 0
     try:
+        # Filesystems must be quiesced first when anything is mounted.  Eject
+        # the disk before opening the bridge with libusb: a handle opened before
+        # diskutil eject can become stale when macOS tears down the storage
+        # service, causing long timeouts and an INCOMPLETE result.
+        if mounts_before != []:
+            _progress(progress, "Unmounting disk volumes cleanly")
+            p = _run(["diskutil", "unmountDisk", f"/dev/{disk}"])
+            if p.returncode != 0:
+                raise RuntimeError(f"could not unmount /dev/{disk}: {p.stderr.decode('utf-8', 'replace').strip()}")
+            unmounted = True
+
+        _progress(progress, "Ejecting the whole disk cleanly")
+        p = _run(["diskutil", "eject", f"/dev/{disk}"])
+        if p.returncode != 0:
+            raise RuntimeError(f"could not eject /dev/{disk}: {p.stderr.decode('utf-8', 'replace').strip()}")
+        ejected = True
+
+        # Enumerate/open only after eject so the handle belongs to the current
+        # post-eject USB device state rather than a storage-stack incarnation
+        # that diskutil just invalidated.
+        _progress(progress, "Opening the RTL9210 after eject")
         devices = _enumerate_rtl9210(lib, ctx)
         usable = [x for x in devices if x.get("open_rc") == 0 and x.get("handle")]
         if not usable:
-            raise RuntimeError("no openable Realtek RTL9210 USB-NVMe bridge was found")
+            raise RuntimeError("no openable Realtek RTL9210 USB-NVMe bridge was found after eject")
         if len(usable) != 1:
             raise RuntimeError(f"{len(usable)} RTL9210 bridges are connected; direct mode refuses ambiguous device selection")
         target = usable[0]
@@ -550,28 +670,32 @@ def read_rtl9210_nvme(device: str) -> Dict[str, Any]:
         bot = target["bot"]
         iface_num = int(bot["number"])
 
-        p = _run(["diskutil", "unmountDisk", f"/dev/{disk}"])
-        if p.returncode != 0:
-            raise RuntimeError(f"could not unmount /dev/{disk}: {p.stderr.decode('utf-8', 'replace').strip()}")
-        unmounted = True
-
+        _progress(progress, "Temporarily detaching the macOS USB storage driver")
         rc = lib.libusb_detach_kernel_driver(handle, iface_num)
         if rc not in (LIBUSB_SUCCESS, LIBUSB_ERROR_NOT_FOUND):
             raise RuntimeError(f"could not capture macOS USB storage driver: {_err(rc)}")
         detached = rc == LIBUSB_SUCCESS
-        time.sleep(0.3)
 
-        rc = lib.libusb_claim_interface(handle, iface_num)
-        if rc != 0:
-            raise RuntimeError(f"could not claim RTL9210 interface: {_err(rc)}")
+        _progress(progress, "Claiming the RTL9210 BOT interface")
+        deadline = time.monotonic() + 0.35
+        while True:
+            rc = lib.libusb_claim_interface(handle, iface_num)
+            if rc == 0:
+                break
+            if rc not in (-6, LIBUSB_ERROR_NOT_FOUND) or time.monotonic() >= deadline:
+                raise RuntimeError(f"could not claim RTL9210 interface: {_err(rc)}")
+            time.sleep(0.02)
         claimed = True
         rc = lib.libusb_set_interface_alt_setting(handle, iface_num, int(bot["alt"]))
         if rc != 0:
             raise RuntimeError(f"could not switch RTL9210 to BOT: {_err(rc)}")
 
+        _progress(progress, "Reading NVMe Identify Controller")
         identify_raw = _rtl_read(lib, handle, bot, NVME_ADMIN_IDENTIFY, NVME_IDENTIFY_CNS_CONTROLLER, NVME_IDENTIFY_LEN, 0x4E560001)
+        _progress(progress, "Reading NVMe SMART / Health log")
         smart_raw = _rtl_read(lib, handle, bot, NVME_ADMIN_GET_LOG_PAGE, NVME_SMART_LOG_ID, NVME_SMART_LEN, 0x4E560002)
-        return {
+
+        result: Dict[str, Any] = {
             "bridge": {
                 "vendor_id": RTL9210_VID, "product_id": RTL9210_PID,
                 "manufacturer": target.get("manufacturer"), "product": target.get("product"),
@@ -580,15 +704,38 @@ def read_rtl9210_nvme(device: str) -> Dict[str, Any]:
             },
             "identify": parse_identify_controller(identify_raw),
             "smart": parse_smart_log(smart_raw),
+            "optional_log_errors": [],
         }
+        if collect_optional_logs:
+            try:
+                _progress(progress, "Reading optional NVMe Error Information log")
+                error_raw = _rtl_read(
+                    lib, handle, bot, NVME_ADMIN_GET_LOG_PAGE, NVME_ERROR_LOG_ID,
+                    NVME_ERROR_LOG_LEN, 0x4E560003, timeout_ms=USB_OPTIONAL_TIMEOUT_MS,
+                )
+                result["error_log"] = parse_error_log(error_raw)
+            except Exception as exc:
+                result["optional_log_errors"].append(f"error-information log: {exc}")
+            try:
+                _progress(progress, "Reading optional NVMe Firmware Slot log")
+                fw_raw = _rtl_read(
+                    lib, handle, bot, NVME_ADMIN_GET_LOG_PAGE, NVME_FW_SLOT_LOG_ID,
+                    NVME_FW_SLOT_LOG_LEN, 0x4E560004, timeout_ms=USB_OPTIONAL_TIMEOUT_MS,
+                )
+                result["firmware_slot_log"] = parse_firmware_slot_log(fw_raw)
+            except Exception as exc:
+                result["optional_log_errors"].append(f"firmware-slot log: {exc}")
+        return result
     finally:
         if handle:
             if claimed:
+                _progress(progress, "Releasing the RTL9210 interface")
                 try:
                     lib.libusb_release_interface(handle, iface_num)
                 except Exception:
                     pass
             if detached:
+                _progress(progress, "Returning the USB storage driver to macOS")
                 try:
                     lib.libusb_attach_kernel_driver(handle, iface_num)
                 except Exception:
@@ -606,6 +753,11 @@ def read_rtl9210_nvme(device: str) -> Dict[str, Any]:
             lib.libusb_exit(ctx)
         except Exception:
             pass
-        if unmounted:
-            if _wait_for_disk(disk, 15.0):
+        if ejected and should_remount:
+            _progress(progress, "Waiting for macOS to re-detect the disk")
+            if _wait_for_disk(disk, 8.0):
+                _progress(progress, "Restoring the original mounted state")
                 _run(["diskutil", "mountDisk", f"/dev/{disk}"])
+            else:
+                _progress(progress, "Disk did not reappear before the restore timeout")
+        _progress(progress, "Direct USB NVMe read complete")

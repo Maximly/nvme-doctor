@@ -97,7 +97,7 @@ The rule engine distinguishes direct evidence from correlation. Platform-specifi
 
 ## Safety model
 
-NVMe commands used for health collection are read-only. Remediation text may suggest a reversible A/B test, but the program does not perform controller resets, power-policy changes, firmware updates, namespace operations or destructive commands. On macOS RTL9210 direct access temporarily unmounts and captures the USB device, then restores and remounts it.
+NVMe commands used for health collection are read-only. Remediation text may suggest a reversible A/B test, but the program does not perform controller resets, power-policy changes, firmware updates, namespace operations or destructive commands. On macOS RTL9210 direct access temporarily unmounts and captures the USB device, then restores its original mount state.
 
 ## JSON schema
 

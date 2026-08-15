@@ -75,3 +75,41 @@ def test_missing_health_evidence_is_incomplete_not_ok():
     s.smart = {}
     report = diagnose(s)
     assert report.status == "INCOMPLETE"
+
+
+def test_usb_reset_is_transport_warning_even_with_clean_smart():
+    s = snap()
+    s.controller = "sdf"
+    s.device_path = "/dev/sdf"
+    s.controller_info.update({
+        "native_nvme": False,
+        "transport": "USB -> NVMe",
+        "nvme_passthrough": True,
+        "usb_path": {
+            "usb_port": "2-3", "vid_pid": "0bda:9210",
+            "usb_version": "3.20", "speed_mbps": 10000, "interface_driver": "uas",
+        },
+    })
+    s.kernel_lines = [
+        "usb 2-3: reset SuperSpeed USB device number 5 using xhci_hcd",
+        "uas_eh_device_reset_handler 6:0:0:0: reset",
+    ]
+    report = diagnose(s)
+    assert report.status == "WARNING"
+    assert "usb-transport-instability" in codes(report)
+    assert any(row["label"] == "USB transport" and row["state"] == "PROBLEM" for row in report.assessment["domains"])
+
+
+def test_usb3_bridge_at_480mbps_is_downshift_warning():
+    s = snap()
+    s.controller = "sdf"
+    s.device_path = "/dev/sdf"
+    s.controller_info.update({
+        "native_nvme": False,
+        "transport": "USB -> NVMe",
+        "nvme_passthrough": True,
+        "usb_path": {"usb_port": "2-3", "usb_version": "3.20", "speed_mbps": 480, "interface_driver": "uas"},
+    })
+    report = diagnose(s)
+    assert "usb-link-downshift" in codes(report)
+    assert report.status == "WARNING"

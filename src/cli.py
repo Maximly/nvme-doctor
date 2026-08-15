@@ -6,9 +6,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from . import __version__
 from .collect import collect_snapshot, collect_topology, discover_controllers
@@ -66,6 +67,16 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--direct-usb", action="store_true",
         help="macOS RTL9210 only: temporarily unmount/capture the USB enclosure and read NVMe Identify/SMART directly (requires sudo + libusb)",
     )
+    parser.add_argument(
+        "--usb-extra-logs", action="store_true",
+        help="macOS RTL9210 direct mode: also request NVMe Error Information and Firmware Slot logs (slower on bridges that reject optional pages)",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="show detailed collection stages and elapsed timing",
+    )
+    # Backward-compatible switch: suppress the normal console spinner.
+    parser.add_argument("--no-progress", action="store_true", help=argparse.SUPPRESS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,19 +167,99 @@ def command_list(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+class _ConsoleSpinner:
+    """Single-line console spinner used by normal human checks."""
+
+    def __init__(self, interval: float = 0.4) -> None:
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._width = len("Checking...")
+
+    @staticmethod
+    def _write(text: str) -> None:
+        data = text.encode("utf-8", "replace")
+        try:
+            os.write(1, data)
+        except Exception:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    def start(self) -> None:
+        self._stop.clear()
+        # Fixed-width frames prevent remnants when cycling from ... back to .
+        # Hide the terminal cursor for the duration of the transient spinner.
+        self._write("\x1b[?25lChecking.  ")
+        self._thread = threading.Thread(target=self._run, name="nvme-doctor-spinner", daemon=True)
+        try:
+            self._thread.start()
+        except Exception:
+            self._thread = None
+            self._write("\r" + (" " * self._width) + "\r\x1b[?25h")
+            raise
+
+    def _run(self) -> None:
+        states = ("Checking.. ", "Checking...", "Checking.  ")
+        idx = 0
+        while not self._stop.wait(self.interval):
+            self._write("\r" + states[idx])
+            idx = (idx + 1) % len(states)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.2, self.interval * 2))
+            self._thread = None
+        # Remove the transient line completely and restore the cursor before
+        # printing the final status/report.
+        self._write("\r" + (" " * self._width) + "\r\x1b[?25h")
+
+
+def _spinner_for_check(args: argparse.Namespace, *, output: Optional[str] = None) -> Optional[_ConsoleSpinner]:
+    if output or getattr(args, "json", False) or getattr(args, "debug", False) or getattr(args, "no_progress", False):
+        return None
+    return _ConsoleSpinner()
+
+
+def _progress_callback(
+    args: argparse.Namespace, *, output: Optional[str] = None
+) -> Optional[Callable[[str], None]]:
+    """Return an unbuffered elapsed-time debug logger.
+
+    Normal checks are intentionally quiet after the immediate version banner.
+    Detailed collector timing is shown only with --debug.  Debug output goes to
+    stderr so JSON/report output remains machine-readable.
+    """
+    if not getattr(args, "debug", False):
+        return None
+    started = time.monotonic()
+
+    def emit(message: str) -> None:
+        elapsed = time.monotonic() - started
+        line = f"[DEBUG +{elapsed:4.1f}s] {message}\n"
+        try:
+            os.write(2, line.encode("utf-8", "replace"))
+        except Exception:
+            print(line, end="", file=sys.stderr, flush=True)
+
+    return emit
+
+
 def _direct_usb_auto_permission(
     device: str,
     args: argparse.Namespace,
     snapshot,
     *,
     output: Optional[str] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Decide whether a normal macOS check may use direct RTL9210 access.
 
-    Explicit --direct-usb always wins.  Without it, an already-unmounted disk
-    may be read automatically.  A mounted disk requires an interactive yes/no
-    confirmation.  JSON/non-interactive/report automation never gets an
-    implicit unmount; scripts must pass --direct-usb explicitly.
+    For an interactive human `check`, sudo is the opt-in to temporary exclusive
+    access: if the target is an RTL9210 bridge and SMART is otherwise
+    unavailable, enter the read-only direct backend automatically.  JSON and
+    report-to-file automation remain non-disruptive unless --direct-usb is
+    explicitly supplied.
     """
     if getattr(args, "direct_usb", False):
         return True
@@ -181,66 +272,78 @@ def _direct_usb_auto_permission(
     if os.geteuid() != 0:
         return False
 
+    # Do not surprise machine-readable/report automation with an unmount/eject.
+    if getattr(args, "json", False) or output:
+        return False
+
     try:
         from .macos_usb_nvme import mounted_volumes
+        if progress:
+            progress("Checking mounted volumes before automatic direct USB access")
         mounts = mounted_volumes(device)
     except Exception:
         mounts = None
 
-    # Machine-readable/non-interactive use must never acquire permission by
-    # surprise, even when no filesystem is currently mounted. --direct-usb is
-    # the explicit automation opt-in.
-    if getattr(args, "json", False) or output or not sys.stdin.isatty() or not sys.stderr.isatty():
-        return False
+    snapshot.controller_info["_direct_usb_mount_state_checked"] = True
+    snapshot.controller_info["_direct_usb_mounts_before"] = mounts
 
-    # In an interactive terminal, if we can prove nothing is mounted, direct
-    # access can proceed automatically without a filesystem disruption.
-    if mounts == []:
-        return True
-
-    print(
-        f"Direct NVMe access for {snapshot.controller_info.get('model') or device} requires temporary exclusive USB access.",
-        file=sys.stderr,
-    )
-    if mounts:
-        print("Mounted volumes:", file=sys.stderr)
-        for mount in mounts:
-            print(f"  {mount}", file=sys.stderr)
-    else:
-        print("Mounted-volume state could not be determined reliably.", file=sys.stderr)
-    print(
-        "NVMe Doctor will temporarily unmount the disk if needed, read the underlying NVMe identity/health data, then restore it.",
-        file=sys.stderr,
-    )
-    try:
-        print("Continue? [y/N] ", end="", file=sys.stderr, flush=True)
-        answer = sys.stdin.readline().strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print(file=sys.stderr)
-        return False
-    return answer in {"y", "yes"}
+    if progress:
+        if mounts:
+            progress("sudo + RTL9210 detected: entering direct mode; mounted volumes will be restored")
+        elif mounts == []:
+            progress("sudo + RTL9210 detected: entering direct mode; disk is already unmounted")
+        else:
+            progress("sudo + RTL9210 detected: entering direct mode; mount state will be handled conservatively")
+    return True
 
 
 def command_check(args: argparse.Namespace, output: Optional[str] = None) -> int:
-    device = _device_or_error(args.device)
-    explicit_direct = bool(getattr(args, "direct_usb", False))
-    if explicit_direct and platform_key() != "darwin":
-        raise ValueError("--direct-usb is currently supported only on macOS with Realtek RTL9210 USB-NVMe bridges")
+    # Human console contract: show build immediately, then a single transient
+    # Checking./Checking../Checking... line until the final status/report is ready.
+    human_console = not getattr(args, "json", False) and not output
+    if human_console:
+        print(f"NVMe Doctor {__version__}", flush=True)
 
-    # Ordinary macOS external-USB collection is intentionally fast and
-    # non-disruptive.  It classifies the target and direct-USB capability first.
-    snapshot = collect_snapshot(
-        device, kernel_lines=max(20, args.kernel_lines), direct_usb=explicit_direct
-    )
+    progress = _progress_callback(args, output=output)
+    spinner = _spinner_for_check(args, output=output)
+    if spinner:
+        spinner.start()
 
-    if not explicit_direct and _direct_usb_auto_permission(device, args, snapshot, output=output):
+    try:
+        if progress:
+            progress(f"Starting check of {args.device or 'auto-selected device'}")
+        device = _device_or_error(args.device)
+        explicit_direct = bool(getattr(args, "direct_usb", False))
+        if progress and device != (args.device or device):
+            progress(f"Resolved target to {device}")
+        if explicit_direct and platform_key() != "darwin":
+            raise ValueError("--direct-usb is currently supported only on macOS with Realtek RTL9210 USB-NVMe bridges")
+
+        auto_direct = (
+            platform_key() == "darwin"
+            and os.geteuid() == 0
+            and not getattr(args, "json", False)
+            and not output
+            and not explicit_direct
+        )
         snapshot = collect_snapshot(
-            device, kernel_lines=max(20, args.kernel_lines), direct_usb=True
+            device, kernel_lines=max(20, args.kernel_lines), direct_usb=explicit_direct,
+            auto_direct_usb=auto_direct,
+            usb_extra_logs=bool(getattr(args, "usb_extra_logs", False)),
+            progress=progress,
         )
 
-    report = diagnose(snapshot)
-    text = render_json(report) if args.json else render_text(report, verbose=args.verbose)
+        if progress:
+            progress("Analyzing collected health data")
+        report = diagnose(snapshot)
+        text = render_json(report) if args.json else render_text(report, verbose=args.verbose)
+    finally:
+        if spinner:
+            spinner.stop()
+
     _write_output(text, output)
+    if progress:
+        progress("Check complete")
     return _status_code(report.status)
 
 

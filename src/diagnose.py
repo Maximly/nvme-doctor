@@ -51,6 +51,10 @@ def _kernel_flags(lines: Iterable[str]) -> Dict[str, Any]:
         "aer_uncorrected": re.compile(r"AER:.*uncorrect|uncorrected.*error|severity=(?:fatal|uncorrected)", re.I),
         "aer_corrected": re.compile(r"AER:.*corrected|corrected error", re.I),
         "link": re.compile(r"link down|link retrain|surprise down|DPC:.*containment", re.I),
+        "usb_reset": re.compile(r"(?:usb .*reset|reset (?:super|high|full)-speed usb device|uas_eh_.*reset|usb-storage.*reset)", re.I),
+        "usb_disconnect": re.compile(r"(?:usb .*disconnect|USB disconnect|device descriptor read|device not accepting address|cannot enable)", re.I),
+        "uas_error": re.compile(r"(?:uas_eh_abort_handler|uas_eh_device_reset_handler|uas.*(?:abort|reset|failed|error))", re.I),
+        "scsi_io": re.compile(r"(?:I/O error, dev sd[a-z]+|blk_update_request.*sd[a-z]+|Buffer I/O error.*sd[a-z]+)", re.I),
     }
     out: Dict[str, Any] = {key: [] for key in patterns}
     for line in lines:
@@ -115,6 +119,71 @@ def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) 
 
     # Media / integrity
     media_sev = _finding_severity(findings, {"nvme-critical-warning", "available-spare", "media-errors"})
+    if snapshot.controller_info.get("native_nvme") is False:
+        usb = snapshot.controller_info.get("usb_path") if isinstance(snapshot.controller_info.get("usb_path"), dict) else {}
+        usb_reset = kernel.get("usb_reset", [])
+        usb_disconnect = kernel.get("usb_disconnect", [])
+        uas_error = kernel.get("uas_error", [])
+        scsi_io = kernel.get("scsi_io", [])
+        transport_events = len(usb_reset) + len(usb_disconnect) + len(uas_error)
+        if transport_events or scsi_io:
+            evidence = []
+            if usb.get("usb_port"):
+                evidence.append(f"usb_port={usb.get('usb_port')}")
+            if usb.get("vid_pid"):
+                evidence.append(f"usb_vid_pid={usb.get('vid_pid')}")
+            if usb.get("interface_driver"):
+                evidence.append(f"usb_driver={usb.get('interface_driver')}")
+            evidence += (usb_disconnect + uas_error + usb_reset + scsi_io)[-6:]
+            findings.append(Finding(
+                "usb-transport-instability",
+                "warning",
+                "USB storage transport shows reset/disconnect evidence",
+                "Target-correlated host logs contain USB/UAS/SCSI transport recovery or I/O events. When NVMe media SMART remains clean, this evidence points more strongly to the enclosure, cable, port, power delivery, or USB host path than to NAND media.",
+                "high" if transport_events >= 2 or scsi_io else "medium",
+                evidence,
+                [
+                    "Retest the enclosure on a direct host USB port with a known-good short cable and avoid hubs/docks for the comparison.",
+                    "Compare the same SSD on native PCIe/M.2 if the resets continue; preserve the before/after nvme-doctor reports.",
+                ],
+            ))
+
+        speed = usb.get("speed_mbps")
+        version = str(usb.get("usb_version") or "").strip()
+        try:
+            speed_num = float(speed) if speed is not None else None
+        except (TypeError, ValueError):
+            speed_num = None
+        try:
+            version_num = float(version) if version else None
+        except ValueError:
+            version_num = None
+        if version_num is not None and version_num >= 3.0 and speed_num is not None and speed_num <= 480:
+            findings.append(Finding(
+                "usb-link-downshift",
+                "warning",
+                "USB 3.x bridge is operating at USB 2.0 speed",
+                f"The bridge reports USB {version} capability but the current sysfs link speed is only {speed_num:g} Mb/s.",
+                "high",
+                [
+                    f"usb_version={version}",
+                    f"speed_mbps={speed_num:g}",
+                    f"usb_port={usb.get('usb_port') or 'unknown'}",
+                ],
+                ["Replace/reseat the cable and bypass hubs/docks, then confirm the link returns to SuperSpeed (5 Gb/s or faster)."],
+            ))
+
+        if str(usb.get("interface_driver") or "").lower() == "usb-storage":
+            findings.append(Finding(
+                "usb-bot-transport",
+                "info",
+                "USB mass storage is using usb-storage/BOT",
+                "The host bound the enclosure to the bulk-only usb-storage path rather than UAS. This is not a health failure, but it can limit queueing/performance and is useful when comparing bridge behavior between ports/hosts.",
+                "high",
+                [f"interface_driver={usb.get('interface_driver')}", f"usb_port={usb.get('usb_port') or 'unknown'}"],
+                ["If the enclosure is expected to support UAS, compare on another host/port and check whether the bridge is being quirked to usb-storage."],
+            ))
+
     critical_warning = _smart_int(smart, "critical_warning", "critical_warning_raw")
     media_errors = _smart_int(smart, "media_errors", "media_and_data_integrity_errors")
     if media_sev in {"critical", "warning"}:
@@ -124,6 +193,29 @@ def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) 
         rows.append({"label": "Media / integrity", "state": "CLEAN", "detail": f"SMART critical warning clear; {media_errors or 0} media/data-integrity errors"})
     else:
         rows.append({"label": "Media / integrity", "state": "UNKNOWN", "detail": "NVMe SMART/Health data was not collected"})
+
+    # USB transport is a separate failure domain from the underlying NVMe media.
+    if snapshot.controller_info.get("native_nvme") is False:
+        usb_codes = {"usb-transport-instability", "usb-link-downshift"}
+        usb_sev = _finding_severity(findings, usb_codes)
+        usb = snapshot.controller_info.get("usb_path") if isinstance(snapshot.controller_info.get("usb_path"), dict) else {}
+        if usb_sev in {"critical", "warning"}:
+            detail = "; ".join(f.title for f in findings if f.code in usb_codes and f.severity in {"critical", "warning"})
+            rows.append({"label": "USB transport", "state": "PROBLEM", "detail": detail})
+        elif usb:
+            bits = []
+            if usb.get("usb_port"):
+                bits.append(f"port {usb.get('usb_port')}")
+            if usb.get("speed_mbps") is not None:
+                bits.append(f"{usb.get('speed_mbps')} Mb/s")
+            if usb.get("interface_driver"):
+                bits.append(str(usb.get("interface_driver")))
+            usb_events = len(kernel.get("usb_reset", [])) + len(kernel.get("usb_disconnect", [])) + len(kernel.get("uas_error", []))
+            if snapshot.capabilities.get("targeted_kernel_log", True) and usb_events == 0:
+                bits.append("no target-scoped USB reset/disconnect evidence")
+            rows.append({"label": "USB transport", "state": "CLEAN", "detail": "; ".join(bits) or "host USB path identified"})
+        else:
+            rows.append({"label": "USB transport", "state": "UNKNOWN", "detail": "USB bridge path details were not available"})
 
     # PCIe / controller path
     pcie_codes = {"pcie-aer-fatal", "pcie-aer-nonfatal", "pcie-aer-corrected", "pcie-link-degraded", "kernel-controller-down", "kernel-reset-timeout", "likely-pcie-path"}
@@ -198,7 +290,7 @@ def _build_assessment(snapshot: Snapshot, findings: List[Finding], status: str) 
         if snapshot.controller_info.get("nvme_passthrough") is False:
             if snapshot.controller_info.get("passthrough_reason") == "darwin-no-scsi-passthrough":
                 if snapshot.controller_info.get("direct_usb"):
-                    recommendation = f"Direct RTL9210 access is available. Close applications using the disk, then run `sudo nvme-doctor check {snapshot.controller} --direct-usb`; NVMe Doctor will temporarily unmount/capture the enclosure, read Identify + SMART, release it, and remount it."
+                    recommendation = f"Direct RTL9210 access is available. Close applications using the disk, then run `sudo nvme-doctor check {snapshot.controller}`; NVMe Doctor will temporarily unmount/capture the enclosure, read Identify + SMART, release it, and restore its original mount state."
                 else:
                     recommendation = "The SSD is present, but smartctl cannot use the SNT pass-through path on macOS. Use a native NVMe path, inspect it on Linux, or use a bridge supported by NVMe Doctor's direct USB backend."
             else:
@@ -229,7 +321,7 @@ def diagnose(snapshot: Snapshot) -> Report:
             ("NVMe SMART is available through explicit direct USB mode" if (darwin_no_scsi and direct_ready)
              else "Underlying NVMe health is unavailable through this macOS USB path" if darwin_no_scsi
              else "Underlying NVMe health is hidden by the USB bridge"),
-            ("The external SSD is visible through an RTL9210 bridge. smartctl cannot use its SNT path on macOS, but NVMe Doctor can read the underlying NVMe Identify/SMART data by temporarily capturing the USB device when --direct-usb is explicitly requested."
+            ("The external SSD is visible through an RTL9210 bridge. smartctl cannot use its SNT path on macOS, but NVMe Doctor can read the underlying NVMe Identify/SMART data by temporarily capturing the USB device when nvme-doctor is run with sudo (or --direct-usb is explicitly requested)."
              if (darwin_no_scsi and direct_ready)
              else "The external physical SSD is visible to macOS, but current smartmontools Darwin builds do not implement the SCSI device pass-through required by sntrealtek/sntjmicron/sntasmedia USB-NVMe bridge backends." if darwin_no_scsi
              else "The external physical SSD is visible to the OS, but NVMe admin/SMART passthrough could not be opened through the USB enclosure."),
@@ -239,7 +331,7 @@ def diagnose(snapshot: Snapshot) -> Report:
                 f"usb_bridge={snapshot.controller_info.get('usb_bridge') or 'unknown'}",
             ],
             ([
-                f"Re-run explicitly as `sudo nvme-doctor check {snapshot.controller} --direct-usb` to temporarily unmount/capture the RTL9210 and read NVMe Identify + SMART.",
+                f"Re-run explicitly as `sudo nvme-doctor check {snapshot.controller}` to temporarily unmount/capture the RTL9210 and read NVMe Identify + SMART.",
                 "Direct USB mode is read-only at the NVMe command level, but it temporarily unmounts and reattaches the enclosure; close applications using the disk first.",
             ] if (darwin_no_scsi and direct_ready) else [
                 "For full NVMe health/admin data on this device, use a native NVMe path visible to macOS or inspect it on Linux.",
@@ -271,6 +363,71 @@ def diagnose(snapshot: Snapshot) -> Report:
             [f"device={snapshot.device_path}", f"transport={snapshot.controller_info.get('transport') or 'USB/SCSI -> NVMe'}"],
             ["Use the SMART/Health results normally; connect the SSD through native PCIe/M.2 only when PCIe-link/AER/NUMA diagnosis is required."],
         ))
+
+    if snapshot.controller_info.get("native_nvme") is False:
+        usb = snapshot.controller_info.get("usb_path") if isinstance(snapshot.controller_info.get("usb_path"), dict) else {}
+        usb_reset = kernel.get("usb_reset", [])
+        usb_disconnect = kernel.get("usb_disconnect", [])
+        uas_error = kernel.get("uas_error", [])
+        scsi_io = kernel.get("scsi_io", [])
+        transport_events = len(usb_reset) + len(usb_disconnect) + len(uas_error)
+        if transport_events or scsi_io:
+            evidence = []
+            if usb.get("usb_port"):
+                evidence.append(f"usb_port={usb.get('usb_port')}")
+            if usb.get("vid_pid"):
+                evidence.append(f"usb_vid_pid={usb.get('vid_pid')}")
+            if usb.get("interface_driver"):
+                evidence.append(f"usb_driver={usb.get('interface_driver')}")
+            evidence += (usb_disconnect + uas_error + usb_reset + scsi_io)[-6:]
+            findings.append(Finding(
+                "usb-transport-instability",
+                "warning",
+                "USB storage transport shows reset/disconnect evidence",
+                "Target-correlated host logs contain USB/UAS/SCSI transport recovery or I/O events. When NVMe media SMART remains clean, this evidence points more strongly to the enclosure, cable, port, power delivery, or USB host path than to NAND media.",
+                "high" if transport_events >= 2 or scsi_io else "medium",
+                evidence,
+                [
+                    "Retest the enclosure on a direct host USB port with a known-good short cable and avoid hubs/docks for the comparison.",
+                    "Compare the same SSD on native PCIe/M.2 if the resets continue; preserve the before/after nvme-doctor reports.",
+                ],
+            ))
+
+        speed = usb.get("speed_mbps")
+        version = str(usb.get("usb_version") or "").strip()
+        try:
+            speed_num = float(speed) if speed is not None else None
+        except (TypeError, ValueError):
+            speed_num = None
+        try:
+            version_num = float(version) if version else None
+        except ValueError:
+            version_num = None
+        if version_num is not None and version_num >= 3.0 and speed_num is not None and speed_num <= 480:
+            findings.append(Finding(
+                "usb-link-downshift",
+                "warning",
+                "USB 3.x bridge is operating at USB 2.0 speed",
+                f"The bridge reports USB {version} capability but the current sysfs link speed is only {speed_num:g} Mb/s.",
+                "high",
+                [
+                    f"usb_version={version}",
+                    f"speed_mbps={speed_num:g}",
+                    f"usb_port={usb.get('usb_port') or 'unknown'}",
+                ],
+                ["Replace/reseat the cable and bypass hubs/docks, then confirm the link returns to SuperSpeed (5 Gb/s or faster)."],
+            ))
+
+        if str(usb.get("interface_driver") or "").lower() == "usb-storage":
+            findings.append(Finding(
+                "usb-bot-transport",
+                "info",
+                "USB mass storage is using usb-storage/BOT",
+                "The host bound the enclosure to the bulk-only usb-storage path rather than UAS. This is not a health failure, but it can limit queueing/performance and is useful when comparing bridge behavior between ports/hosts.",
+                "high",
+                [f"interface_driver={usb.get('interface_driver')}", f"usb_port={usb.get('usb_port') or 'unknown'}"],
+                ["If the enclosure is expected to support UAS, compare on another host/port and check whether the bridge is being quirked to usb-storage."],
+            ))
 
     critical_warning = _smart_int(smart, "critical_warning", "critical_warning_raw")
     if critical_warning:

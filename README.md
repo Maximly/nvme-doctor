@@ -12,7 +12,7 @@ NVMe Doctor is GPL-3.0-or-later software from KernelSoft.
 
 ## Status
 
-Version **1.0.3** is the consolidated public release.
+Version **1.0.9** is the consolidated public release.
 
 The repository contains both the maintainable flat source tree under `src/` and a pre-built standalone `nvme-doctor` executable. The standalone file contains all Python modules required by NVMe Doctor and can be copied directly to another Linux or macOS system with Python 3.9+.
 
@@ -69,7 +69,13 @@ For JSON, reports, scripts, cron, or any non-interactive invocation, pass explic
 sudo ./nvme-doctor check disk4 --direct-usb
 ```
 
-Direct mode temporarily unmounts the whole external disk, captures the RTL9210 USB storage interface, selects its BOT alternate setting, sends read-only NVMe Identify (`0x06`) and SMART/Get Log Page (`0x02`, LID `0x02`) commands through the RTL9210 `0xE4` tunnel, then releases the USB device and remounts it. Close applications using that disk first. To avoid capturing the wrong enclosure, direct mode currently refuses to run when multiple external USB SSDs or multiple RTL9210 bridges are connected.
+Direct mode temporarily acquires the whole external disk, captures the RTL9210 USB storage interface, selects its BOT alternate setting, and sends read-only NVMe Identify (`0x06`) plus SMART Get Log Page (`0x02`) commands through the RTL9210 `0xE4` tunnel. Normal human `check` runs print the NVMe Doctor name/version immediately, then show one transient fixed-width in-place `Checking.  ` / `Checking.. ` / `Checking...` line until collection and diagnosis finish; the cursor is hidden while waiting, then the line is erased and the cursor restored before the final status/report. `--debug` disables the spinner and enables elapsed-time collection diagnostics on stderr (for example `[CHECK +0.4s] Reading NVMe SMART / Health log`, `[CHECK +1.1s] Collecting target-scoped OS/kernel events`, or `[CHECK +1.3s] Ejecting the whole disk cleanly`). Debug timing is unbuffered and written to stderr, so `--json` stdout remains clean. The direct RTL9210 path opens the bridge only after the safe whole-disk eject to avoid stale libusb handles; the normal path remains intentionally short; optional Error Information/Firmware Slot reads are available only with `--usb-extra-logs` because some bridge firmware stalls before rejecting unsupported optional pages. Before the temporary USB-driver detach, macOS is given a proper whole-disk `diskutil eject` so the capture is not treated as an unsafe removal. The USB interface is then released, the storage driver re-probes the media, and the disk's original mount state is restored. Close applications using a mounted disk first. To avoid capturing the wrong enclosure, direct mode currently refuses to run when multiple external USB SSDs or multiple RTL9210 bridges are connected.
+
+For the slower extended read-only USB probe:
+
+```bash
+sudo ./nvme-doctor check disk4 --direct-usb --usb-extra-logs
+```
 
 Current smartmontools Darwin builds still cannot use the SCSI pass-through layer required by `sntrealtek` directly on `/dev/diskN`; NVMe Doctor's RTL9210 backend bypasses that limitation with libusb. Other bridge chipsets remain `INCOMPLETE` unless macOS/smartctl exposes a usable NVMe path.
 
