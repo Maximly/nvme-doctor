@@ -7,6 +7,7 @@ def test_flat_source_layout_and_standalone_executable(tmp_path):
     root = Path(__file__).resolve().parents[1]
     assert (root / "src" / "cli.py").is_file()
     assert (root / "src" / "macos_usb_nvme.py").is_file()
+    assert (root / "src" / "macos_usb_sata.py").is_file()
     assert not (root / "src" / "nvme_doctor").exists()
 
     result = subprocess.run(
@@ -18,7 +19,9 @@ def test_flat_source_layout_and_standalone_executable(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "nvme-doctor 1.1.12"
+    assert result.stdout.strip() == "nvme-doctor 1.1.20"
+    standalone = (root / "nvme-doctor").read_text(encoding="utf-8")
+    assert "'nvme_doctor.macos_usb_sata':" in standalone
 
     rebuilt = tmp_path / "nvme-doctor"
     build = subprocess.run(
@@ -46,7 +49,7 @@ def test_build_script_rebuilds_root_standalone(tmp_path):
             check=False,
         )
         assert result.returncode == 0, result.stderr
-        assert "nvme-doctor 1.1.12" in result.stdout
+        assert "nvme-doctor 1.1.20" in result.stdout
         assert (root / "nvme-doctor").is_file()
     finally:
         # A successful build is deterministic, but preserve the checked-in artifact

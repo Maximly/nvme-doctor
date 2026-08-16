@@ -19,6 +19,7 @@ CLI
  |            +-- diskutil physical-disk inventory
  |            +-- smartctl --scan[-open] / smartctl -a -j
  |            +-- macos_usb_nvme.py (RTL9210 direct USB path)
+ |            +-- macos_usb_sata.py (generic read-only SAT/BOT USB-SATA path)
  |            +-- target-scoped unified-log evidence where possible
  |
  +-- diagnose.py -------------- shared evidence/correlation rules

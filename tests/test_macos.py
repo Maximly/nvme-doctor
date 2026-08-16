@@ -8,6 +8,7 @@ from src.collect_macos import (
 )
 from src.diagnose import diagnose
 from src.model import CommandResult, Snapshot
+from src.render import render_text
 from src.util import normalize_macos_device
 
 
@@ -492,3 +493,257 @@ def test_macos_external_usb_fast_path_skips_slow_native_collectors():
     assert not any(call[:2] == ["smartctl", "--scan"] for call in runner.calls)
     assert not any(call[:2] == ["log", "show"] for call in runner.calls)
     assert not any(call[:3] == ["diskutil", "list", "-plist"] for call in runner.calls)
+
+
+class FakeSa510UsbRunner(FakeDiskutilUsbRunner):
+    """Observed user case: WD Blue SA510 behind USB on macOS; SAT SMART is unavailable."""
+
+    def run(self, argv, timeout=8.0):
+        argv = list(argv)
+        if argv[:3] == ["diskutil", "info", "-plist"] and argv[3].endswith("/disk4"):
+            self.calls.append(argv)
+            return CommandResult(argv, 0, stdout=_plist({
+                "DeviceIdentifier": "disk4",
+                "WholeDisk": True,
+                "VirtualOrPhysical": "Physical",
+                "Internal": False,
+                "BusProtocol": "USB",
+                "SolidState": True,
+                "MediaName": "SA510 2.5 2TB",
+                "TotalSize": 2_000_398_934_016,
+                "SMARTStatus": "Not Supported",
+            }))
+        if argv[:3] == ["smartctl", "-i", "-j"] and argv[-1] == "/dev/disk4" and "sat" in argv:
+            self.calls.append(argv)
+            return CommandResult(argv, 2, stdout=json.dumps({
+                "device": {"name": "/dev/disk4", "type": "sat", "protocol": "SCSI"},
+                "model_name": "SA510 2.5 2TB",
+                "smartctl": {"exit_status": 2},
+            }))
+        return super().run(argv, timeout)
+
+
+class FakeSa510UsbAutoSmartRunner(FakeSa510UsbRunner):
+    """Observed UGREEN case: plain smartctl works while forcing -d sat fails."""
+
+    def run(self, argv, timeout=8.0):
+        argv = list(argv)
+        if argv[:3] == ["smartctl", "-i", "-j"] and argv[-1] == "/dev/disk4" and "-d" not in argv:
+            self.calls.append(argv)
+            return CommandResult(argv, 0, stdout=json.dumps({
+                "device": {"name": "/dev/disk4", "type": "sat", "protocol": "ATA"},
+                "model_name": "WD Blue SA510 2.5 2TB",
+                "serial_number": "23074M442603",
+                "firmware_version": "530309WD",
+                "rotation_rate": 0,
+                "sata_version": {"string": "SATA 3.3", "value": 511},
+            }))
+        if argv[:3] == ["smartctl", "-a", "-j"] and argv[-1] == "/dev/disk4" and "-d" not in argv:
+            self.calls.append(argv)
+            return CommandResult(argv, 0, stdout=json.dumps({
+                "device": {"name": "/dev/disk4", "type": "sat", "protocol": "ATA"},
+                "model_name": "WD Blue SA510 2.5 2TB",
+                "serial_number": "23074M442603",
+                "firmware_version": "530309WD",
+                "user_capacity": {"bytes": 2_000_398_934_016},
+                "rotation_rate": 0,
+                "sata_version": {"string": "SATA 3.3, 6.0 Gb/s (current: 6.0 Gb/s)", "value": 511},
+                "interface_speed": {
+                    "max": {"sata_value": 6, "string": "6.0 Gb/s"},
+                    "current": {"sata_value": 6, "string": "6.0 Gb/s"},
+                },
+                "smart_status": {"passed": True},
+                "temperature": {"current": 31},
+                "power_on_time": {"hours": 1022},
+                "power_cycle_count": 229,
+                "ata_smart_attributes": {"table": [
+                    {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+                    {"id": 187, "name": "Reported_Uncorrect", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+                    {"id": 188, "name": "Command_Timeout", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+                    {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 1, "string": "1"}},
+                    {"id": 232, "name": "Available_Reservd_Space", "value": 100, "worst": 100, "thresh": 1, "when_failed": "", "raw": {"value": 100, "string": "100"}},
+                    {"id": 233, "name": "Media_Wearout_Indicator", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 4262, "string": "4262"}},
+                ]},
+                "ata_smart_error_log": {"summary": {"count": 0}},
+                "ata_smart_self_test_log": {"standard": {"table": [
+                    {"num": 1, "type": {"string": "Short offline"}, "status": {"string": "Completed without error"}, "lifetime_hours": 232}
+                ]}},
+            }))
+        return super().run(argv, timeout)
+
+
+def test_macos_sa510_usb_is_classified_as_sata_when_sat_smart_is_hidden():
+    runner = FakeSa510UsbRunner()
+    snapshot = collect_snapshot_macos("disk4", runner=runner)
+    report = diagnose(snapshot)
+    text = render_text(report)
+
+    assert snapshot.controller_info["model"] == "SA510 2.5 2TB"
+    assert snapshot.controller_info["protocol"] == "ATA"
+    assert snapshot.controller_info["transport"] == "USB -> SATA"
+    assert snapshot.controller_info["ata_passthrough"] is False
+    assert snapshot.controller_info["passthrough_reason"] == "sat-smart-unavailable"
+    assert snapshot.capabilities["ata_smart"] is False
+    assert report.status == "INCOMPLETE"
+    assert "ATA SMART is unavailable through this macOS USB-SATA path" in text
+    assert "Protocol             ATA" in text
+    assert "Transport            USB -> SATA" in text
+    assert "ATA SMART              unavailable" in text
+    assert "NVMe SMART/Health" not in text
+    assert "Underlying NVMe health" not in text
+    assert "SNT pass-through" not in text
+
+
+def test_macos_ugreen_sa510_prefers_plain_smartctl_when_auto_detection_works(monkeypatch):
+    runner = FakeSa510UsbAutoSmartRunner()
+
+    # Direct USB capture must never be reached when normal smartctl already
+    # exposes complete ATA health through the UGREEN enclosure.
+    import src.macos_usb_sata as direct_sata
+    monkeypatch.setattr(direct_sata, "read_usb_sata_smart", lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct USB fallback must not run")))
+
+    snapshot = collect_snapshot_macos("disk4", runner=runner, auto_direct_usb=True)
+    report = diagnose(snapshot)
+    text = render_text(report)
+
+    assert snapshot.controller_info["backend"] == "diskutil+smartctl-auto"
+    assert snapshot.controller_info["protocol"] == "ATA"
+    assert snapshot.controller_info["transport"] == "USB -> SATA"
+    assert snapshot.controller_info["model"] == "WD Blue SA510 2.5 2TB"
+    assert snapshot.controller_info["serial"] == "23074M442603"
+    assert snapshot.controller_info["firmware_rev"] == "530309WD"
+    assert snapshot.controller_info["ata_passthrough"] is True
+    assert snapshot.smart["smart_passed"] is True
+    assert snapshot.smart["reallocated_sectors"] == 0
+    assert snapshot.smart["udma_crc_errors"] == 1
+    assert snapshot.smart["reserved_space"] == 100
+    assert snapshot.smart["reserved_space_threshold"] == 1
+    assert snapshot.smart["media_wear_indicator"] == 100
+    assert snapshot.capabilities["ata_smart"] is True
+    assert snapshot.capabilities["ata_error_log"] is True
+    assert snapshot.capabilities["ata_self_test_log"] is True
+    assert report.status == "OK"
+    assert "Verdict              HEALTHY" in text
+    assert "ATA SMART              yes" in text
+    assert "ATA SMART is unavailable" not in text
+    assert not any("-d sat" in note for note in snapshot.collection_notes)
+
+
+def test_macos_list_sa510_usb_stays_ata_even_when_sat_probe_fails():
+    items = discover_controllers_macos(FakeSa510UsbRunner())
+    row = next(x for x in items if x["controller"] == "disk4")
+    assert row["model"] == "SA510 2.5 2TB"
+    assert row["protocol"] == "ATA"
+    assert row["transport"] == "USB -> SATA"
+    assert row["ata_passthrough"] is False
+
+
+def test_macos_list_ugreen_sa510_uses_smartctl_auto_identity():
+    items = discover_controllers_macos(FakeSa510UsbAutoSmartRunner())
+    row = next(x for x in items if x["controller"] == "disk4")
+    assert row["model"] == "WD Blue SA510 2.5 2TB"
+    assert row["serial"] == "23074M442603"
+    assert row["firmware"] == "530309WD"
+    assert row["protocol"] == "ATA"
+    assert row["transport"] == "USB -> SATA"
+    assert row["backend"] == "diskutil+smartctl-auto"
+    assert row.get("smartctl_type") is None
+
+
+def test_macos_sa510_usb_auto_direct_sat_can_recover_health(monkeypatch):
+    direct_payload = {
+        "device": {"type": "sat-direct", "protocol": "ATA"},
+        "model_name": "WDC WDS200T3B0A-00AXR0",
+        "serial_number": "WD-SERIAL-123",
+        "firmware_version": "520201WD",
+        "smart_status": {"passed": True},
+        "temperature": {"current": 31},
+        "power_on_time": {"hours": 40},
+        "power_cycle_count": 12,
+        "ata_smart_attributes": {"table": [
+            {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "thresh": 10, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+            {"id": 197, "name": "Current_Pending_Sector", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+            {"id": 198, "name": "Offline_Uncorrectable", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+            {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+        ]},
+    }
+
+    def fake_direct(*args, **kwargs):
+        return {
+            "bridge": {
+                "vendor_id": 0x152D, "product_id": 0x0578,
+                "manufacturer": "JMicron", "product": "USB to ATA/ATAPI Bridge",
+                "access_mode": "BOT + SAT ATA PASS THROUGH(16)",
+            },
+            "smartctl": direct_payload,
+            "thresholds_available": True,
+            "smart_return_status": True,
+        }
+
+    import src.macos_usb_sata as direct_sata
+    monkeypatch.setattr(direct_sata, "read_usb_sata_smart", fake_direct)
+
+    snapshot = collect_snapshot_macos("disk4", runner=FakeSa510UsbRunner(), auto_direct_usb=True)
+    report = diagnose(snapshot)
+    text = render_text(report)
+    assert snapshot.controller_info["protocol"] == "ATA"
+    assert snapshot.controller_info["transport"] == "USB -> SATA"
+    assert snapshot.controller_info["backend"] == "macos-direct-usb-sat"
+    assert snapshot.controller_info["ata_passthrough"] is True
+    assert snapshot.controller_info["usb_vid_pid"] == "152d:0578"
+    assert snapshot.controller_info["model"] == "WDC WDS200T3B0A-00AXR0"
+    assert snapshot.controller_info["serial"] == "WD-SERIAL-123"
+    assert snapshot.smart["reallocated_sectors"] == 0
+    assert snapshot.smart["temperature"] == 31
+    assert snapshot.capabilities["ata_smart"] is True
+    assert report.status == "OK"
+    assert "Verdict              HEALTHY" in text
+    assert "ATA SMART              yes" in text
+    assert "ATA SMART is unavailable" not in text
+
+
+def test_fast_all_topology_macos_uses_diskutil_only_for_internal_apple_ssd():
+    import plistlib
+    from src.collect_macos import collect_all_topologies_macos
+
+    disk_list = {
+        "AllDisksAndPartitions": [
+            {"DeviceIdentifier": "disk0", "Partitions": []},
+        ]
+    }
+    disk_info = {
+        "DeviceIdentifier": "disk0",
+        "WholeDisk": True,
+        "VirtualOrPhysical": "Physical",
+        "MediaName": "APPLE SSD AP8192Z",
+        "TotalSize": 8_000_000_000_000,
+        "Internal": True,
+        "SolidState": True,
+        "BusProtocol": "Apple Fabric",
+        "SMARTStatus": "Verified",
+    }
+
+    class FastTopologyRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, timeout=8.0):
+            self.calls.append(list(argv))
+            if list(argv) == ["diskutil", "list", "-plist"]:
+                return CommandResult(list(argv), 0, stdout=plistlib.dumps(disk_list).decode())
+            if list(argv) == ["diskutil", "info", "-plist", "/dev/disk0"]:
+                return CommandResult(list(argv), 0, stdout=plistlib.dumps(disk_info).decode())
+            raise AssertionError(f"fast topology must not invoke expensive probe: {argv}")
+
+    runner = FastTopologyRunner()
+    topo = collect_all_topologies_macos(runner=runner)
+    assert topo["collection_backend"] == "diskutil-fast-topology"
+    assert topo["complete"] is True
+    assert len(topo["devices"]) == 1
+    dev = topo["devices"][0]
+    assert dev["controller"] == "disk0"
+    assert dev["controller_info"]["model"] == "APPLE SSD AP8192Z"
+    assert dev["controller_info"]["protocol"] == "NVMe"
+    assert dev["controller_info"]["transport"] == "Apple Fabric"
+    assert dev["namespaces"][0]["capacity_bytes"] == 8_000_000_000_000
+    assert all(call[0] == "diskutil" for call in runner.calls)

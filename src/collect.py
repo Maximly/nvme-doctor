@@ -929,55 +929,85 @@ def collect_topology_linux(
     sys_pci: Path = SYS_PCI,
     sys_class_block: Path = SYS_CLASS_BLOCK,
 ) -> Dict[str, Any]:
-    """Collect the hardware path from NUMA locality to an NVMe namespace.
+    """Collect the available hardware path for a Linux storage device.
 
-    This command is intentionally independent of SMART/admin-log collection, so
-    it normally works without root and remains useful on a degraded drive.
+    Native NVMe is resolved through the NVMe controller and PCIe hierarchy.
+    Native libata disks are resolved through the block device's ataN ancestry
+    back to the SATA/AHCI PCI controller.  USB storage remains a translated
+    path because the drive-side PCI/SATA ancestry is hidden by the enclosure.
     """
     runner = runner or Runner()
     controller, device_path = normalize_device(requested_device)
     if not _is_native_linux_nvme(controller):
         block = sys_class_block / controller
+        physical_candidate = _physical_block_candidates_linux(sys_class_block).get(device_path, {})
         bridge_candidate = _usb_solid_state_candidates_linux(sys_class_block).get(device_path, {})
         scan_candidate = _smartctl_candidate_linux(runner, device_path)
         device_type = scan_candidate.get("device_type")
         usb_path = _collect_usb_path_linux(controller, sys_class_block)
+        is_usb = bool(
+            physical_candidate.get("sysfs_usb")
+            or usb_path.get("usb_port")
+            or usb_path.get("vid_pid")
+        )
+        native_sata = physical_candidate.get("sysfs_transport") == "SATA" and not is_usb
+        fallback_ident = _fallback_block_identity_linux(runner, device_path, physical_candidate) if physical_candidate else {}
+
         ci: Dict[str, Any] = {
             "state": "present" if block.exists() else "missing",
-            "transport": "USB/SCSI block device",
+            "transport": "SATA" if native_sata else ("USB storage" if is_usb else "SCSI/block device"),
             "native_nvme": False,
-            "usb_bridge_model": bridge_candidate.get("bridge_model"),
+            "usb_bridge_model": bridge_candidate.get("bridge_model") if is_usb else None,
             "smartctl_device_type": device_type,
-            "usb_path": usb_path,
+            "usb_path": usb_path if is_usb else {},
+            "model": fallback_ident.get("model"),
+            "serial": fallback_ident.get("serial"),
+            "firmware_rev": fallback_ident.get("firmware"),
         }
+        if native_sata:
+            ci["protocol"] = "ATA"
+            ci["identity_source"] = "linux libata/udev"
+            # Keep the libata/SCSI leaf location. Multiple SATA disks commonly
+            # share one AHCI PCI controller; ataN/hostN/LUN is what distinguishes
+            # their host-side attachment beneath that controller.
+            for key in ("ata_port", "scsi_host", "scsi_target", "scsi_lun"):
+                if usb_path.get(key):
+                    ci[key] = usb_path.get(key)
+
         probe = runner.run(_smartctl_args_linux(device_path, mode="-i", device_type=device_type), timeout=4.0)
         payload = read_json(probe.stdout) if probe.available and probe.stdout.strip() else None
         if _smartctl_json_is_nvme(payload):
             ident = _smartctl_identity(payload)
             ci.update({
-                "model": ident.get("model"),
-                "serial": ident.get("serial"),
-                "firmware_rev": ident.get("firmware"),
+                "model": ident.get("model") or ci.get("model"),
+                "serial": ident.get("serial") or ci.get("serial"),
+                "firmware_rev": ident.get("firmware") or ci.get("firmware_rev"),
                 "nvme_version": ident.get("nvme_version"),
                 "protocol": "NVMe",
-                "transport": "USB -> NVMe" if usb_path.get("usb_port") else "translated NVMe",
+                "transport": "USB -> NVMe" if is_usb else "translated NVMe",
                 "identity_source": "smartctl",
             })
         elif _smartctl_json_is_ata(payload):
             ci.update({
-                "model": payload.get("model_name"),
-                "serial": payload.get("serial_number"),
-                "firmware_rev": payload.get("firmware_version"),
+                "model": payload.get("model_name") or ci.get("model"),
+                "serial": payload.get("serial_number") or ci.get("serial"),
+                "firmware_rev": payload.get("firmware_version") or ci.get("firmware_rev"),
                 "protocol": "ATA",
-                "transport": "USB -> SATA" if usb_path.get("usb_port") else "SATA",
+                "transport": "USB -> SATA" if is_usb else "SATA",
                 "sata_version": payload.get("sata_version"),
                 "interface_speed": payload.get("interface_speed"),
                 "identity_source": "smartctl",
             })
-        else:
-            ci["identity_source"] = "unavailable"
+        elif not ci.get("protocol"):
+            # Do not turn an unknown sdX disk into NVMe merely because it is a
+            # solid-state/USB block device.  Preserve what Linux actually knows.
+            if is_usb:
+                ci.update({"protocol": None, "transport": "USB storage", "identity_source": "sysfs/udev"})
+            else:
+                ci.update({"protocol": "SCSI", "transport": "SCSI/block device", "identity_source": "sysfs/udev"})
             if probe.available and probe.returncode not in (0, None):
-                ci["identity_note"] = "storage identity was not readable; rerun topology with sudo"
+                ci["identity_note"] = "SMART identity was not readable; topology uses Linux sysfs/udev evidence"
+
         ns: Dict[str, Any] = {"name": controller, "device": device_path}
         sectors = read_text(block / "size")
         logical = read_text(block / "queue" / "logical_block_size")
@@ -991,29 +1021,89 @@ def collect_topology_linux(
                 ns["logical_block_size"] = int(logical)
         except ValueError:
             pass
-        if ci.get("protocol") == "ATA":
+
+        # Native ATA/SCSI devices can still have a useful PCI controller path.
+        # For USB storage the nearest PCI ancestor is the USB host controller,
+        # which is already represented by usb_path and must not be described as
+        # the drive's SATA/NVMe endpoint.
+        bdf: Optional[str] = None
+        endpoint: Dict[str, Any] = {}
+        chain: List[Dict[str, Any]] = []
+        numa_node: Optional[str] = None
+        local_cpus: Optional[str] = None
+        if not is_usb and block.exists():
+            bdf = _bdf_for_controller(block)
+            endpoint = _collect_pci_sysfs(bdf, sys_pci)
+            raw_chain = _topology_for_bdf(bdf, sys_pci)
+            for raw in reversed(raw_chain):
+                node = dict(raw)
+                node_bdf = str(node.get("bdf") or "")
+                if node_bdf == bdf:
+                    proto = ci.get("protocol")
+                    if proto == "ATA":
+                        node["role"] = "SATA/AHCI controller"
+                    elif proto == "SCSI":
+                        node["role"] = "storage controller"
+                    else:
+                        node["role"] = _pci_class_role(node.get("class"), endpoint=False)
+                else:
+                    node["role"] = _pci_class_role(node.get("class"), endpoint=False)
+                desc = _lspci_description(runner, node_bdf) if node_bdf else None
+                if desc:
+                    node["description"] = desc
+                chain.append(node)
+            numa_node = endpoint.get("numa_node")
+            if numa_node in (None, "-1"):
+                for node in reversed(chain):
+                    if node.get("numa_node") not in (None, "-1"):
+                        numa_node = node.get("numa_node")
+                        break
+            local_cpus = endpoint.get("local_cpulist")
+            if not local_cpus:
+                for node in reversed(chain):
+                    if node.get("local_cpulist"):
+                        local_cpus = node.get("local_cpulist")
+                        break
+
+        protocol = ci.get("protocol")
+        if is_usb and protocol == "ATA":
             notes = [
-                "The ATA/SATA drive is exposed as a Linux block device. SMART identity/health and SATA interface speed are available through smartctl; USB bridges may hide the native SATA host-controller path."
+                "The ATA/SATA drive is accessed through a USB-to-SATA bridge. The host USB path is visible, but the enclosure hides the drive's native SATA host-controller ancestry."
+            ]
+        elif is_usb and protocol == "NVMe":
+            notes = [
+                "The NVMe SSD is accessed through a USB-to-NVMe bridge. Its native NVMe PCIe endpoint, PCIe generation/link, AER and NUMA ancestry are hidden behind the bridge."
+            ]
+        elif is_usb:
+            notes = [
+                "The disk is accessed through USB storage. The underlying ATA/NVMe/SCSI protocol was not confirmed, so topology does not guess the drive type."
+            ]
+        elif protocol == "ATA":
+            notes = [
+                "Linux libata exposes this ATA/SATA drive through an sdX block device; the PCI path shown is the host SATA/AHCI controller ancestry, not an NVMe endpoint."
+            ]
+        elif protocol == "SCSI":
+            notes = [
+                "The disk is exposed through the Linux SCSI block layer; the PCI path shown is the host storage-controller ancestry when resolvable."
             ]
         else:
-            notes = [
-                "The SSD is accessed through a USB/SCSI bridge. Its native NVMe PCIe endpoint, PCIe generation/link, AER and NUMA ancestry are hidden behind the bridge; the host USB/block path and underlying NVMe identity are shown when available."
-            ]
+            notes = ["Storage protocol could not be confirmed; topology is limited to host-visible Linux path evidence."]
         if ci.get("identity_note"):
             notes.append(str(ci.get("identity_note")))
+
         return {
             "platform": "linux",
             "requested_device": requested_device,
             "controller": controller,
             "controller_device": device_path,
             "controller_info": ci,
-            "numa_node": None,
-            "local_cpulist": None,
-            "pci_domain": None,
-            "pci_endpoint": {},
-            "pci_path": [],
+            "numa_node": numa_node,
+            "local_cpulist": local_cpus,
+            "pci_domain": bdf.split(":", 1)[0] if bdf else None,
+            "pci_endpoint": endpoint,
+            "pci_path": chain,
             "namespaces": [ns],
-            "complete": False,
+            "complete": bool((not is_usb) and bdf and chain),
             "notes": notes,
         }
 
@@ -1022,6 +1112,8 @@ def collect_topology_linux(
         raise ValueError(f"{controller_path} is not present; controller may be disconnected or removed")
 
     ci = _collect_controller_sysfs(controller_path)
+    ci["protocol"] = "NVMe"
+    ci["native_nvme"] = True
     bdf = _bdf_for_controller(controller_path)
     endpoint = _collect_pci_sysfs(bdf, sys_pci)
     raw_chain = _topology_for_bdf(bdf, sys_pci)
@@ -1095,6 +1187,24 @@ def collect_topology(
                 ci["model"] = None
                 ci["serial"] = None
                 ci["firmware_rev"] = None
+        protocol = str(ci.get("protocol") or "").upper()
+        transport = str(ci.get("transport") or "")
+        if transport.upper().startswith("USB") and protocol == "ATA":
+            notes = [
+                "This ATA/SATA drive is accessed through a USB-to-SATA bridge. macOS can show the USB/block endpoint and ATA identity/SMART when the bridge exposes it, but the native SATA host-controller ancestry remains hidden behind USB."
+            ]
+        elif transport.upper().startswith("USB") and protocol == "NVME":
+            notes = [
+                "This NVMe SSD is accessed through a USB-to-NVMe bridge. macOS can show the USB/block endpoint, and supported direct backends can identify the underlying NVMe controller, but the SSD's native PCIe/NUMA/AER ancestry remains hidden behind USB."
+            ]
+        elif transport.upper().startswith("USB"):
+            notes = [
+                "This disk is accessed through USB storage. The underlying storage protocol was not confirmed, so topology does not guess ATA versus NVMe."
+            ]
+        elif protocol == "ATA":
+            notes = ["This is an ATA/SATA device; macOS does not expose a Linux-style PCI/NUMA controller ancestry through this backend."]
+        else:
+            notes = ["macOS exposes the storage endpoint, but detailed PCI/NUMA ancestry is not available through this topology backend."]
         return {
             "platform": "darwin",
             "requested_device": requested_device,
@@ -1112,9 +1222,7 @@ def collect_topology(
                 "capacity_bytes": ci.get("tnvmcap") or ci.get("size_in_bytes"),
             }],
             "complete": False,
-            "notes": [
-                "This SSD is accessed through a USB-to-NVMe bridge. macOS can show the USB/block endpoint, and RTL9210 direct mode can identify the underlying NVMe controller, but the SSD's native PCIe/NUMA/AER ancestry remains hidden behind USB."
-            ],
+            "notes": notes,
         }
     raise ValueError(f"unsupported operating system: {key}")
 

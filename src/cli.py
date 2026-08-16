@@ -16,7 +16,7 @@ from . import __version__
 from .collect import collect_snapshot, collect_topology, discover_controllers
 from .diagnose import diagnose
 from .diff import compare_reports, render_diff_text
-from .render import render_json, render_text, render_topology_json, render_topology_text
+from .render import render_json, render_text, render_topology_all_text, render_topology_json, render_topology_text
 from .util import format_bytes_decimal, normalize_device, normalize_macos_device, read_json, to_int
 from .runner import Runner
 from .platforms import platform_key, platform_label
@@ -76,7 +76,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kernel-lines", type=int, default=300, help="maximum number of relevant kernel log lines to keep (default: 300)")
     parser.add_argument(
         "--direct-usb", action="store_true",
-        help="macOS RTL9210 only: temporarily unmount/capture the USB enclosure and read NVMe Identify/SMART directly (requires sudo + libusb)",
+        help="macOS USB storage: permit temporary eject/capture for read-only direct health access (RTL9210 NVMe or SAT-capable USB-SATA; requires sudo + libusb)",
     )
     parser.add_argument(
         "--usb-extra-logs", action="store_true",
@@ -104,9 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_check = sub.add_parser("check", help="collect evidence and diagnose one NVMe or SATA/ATA drive")
     _add_common(p_check)
 
-    p_topology = sub.add_parser("topology", help="show the available host/transport topology for one storage device")
-    p_topology.add_argument("device", nargs="?", help="NVMe controller/namespace or SATA/USB block device")
+    p_topology = sub.add_parser("topology", help="show storage hardware topology; without DEVICE, show all physical drives in one tree")
+    p_topology.add_argument("device", nargs="?", help="NVMe controller/namespace or SATA/USB block device; omit to show all drives")
     p_topology.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_topology.add_argument("--debug", action="store_true", help="show topology collection stages and elapsed timing")
+    p_topology.add_argument("--no-progress", action="store_true", help=argparse.SUPPRESS)
     p_topology.add_argument(
         "--direct-usb", action="store_true",
         help="macOS RTL9210 only: permit temporary unmount/capture to identify the underlying NVMe SSD",
@@ -214,10 +216,19 @@ def _quick_health_probe(item: Dict[str, Any]) -> str:
     if protocol not in {"NVME", "ATA"}:
         return "-"
 
-    # macOS USB NVMe/SATA health may require a translated/direct bridge path,
-    # eject, or capture. `list` must remain non-disruptive and quick.
+    # macOS USB health is shown only when discovery already proved that plain
+    # smartctl or an explicit smartctl bridge backend can read the device
+    # non-disruptively. Never invoke the direct/eject/capture backend from list.
     if platform_key() == "darwin" and "usb" in transport:
-        return "-"
+        backend = str(item.get("backend") or "")
+        if protocol == "ATA" and (
+            "smartctl-auto" in backend
+            or "smartctl-sat" in backend
+            or "smartctl-scan+auto" in backend
+        ):
+            pass
+        else:
+            return "-"
 
     device = str(item.get("device") or "").strip()
     if not device:
@@ -276,13 +287,14 @@ def command_list(args: argparse.Namespace) -> int:
 
 
 class _ConsoleSpinner:
-    """Single-line console spinner used by normal human checks."""
+    """Single-line console spinner used by normal human commands."""
 
-    def __init__(self, interval: float = 0.4) -> None:
+    def __init__(self, interval: float = 0.4, label: str = "Checking") -> None:
         self.interval = interval
+        self.label = label.rstrip(". ") or "Working"
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._width = len("Checking...")
+        self._width = len(self.label) + 3
 
     @staticmethod
     def _write(text: str) -> None:
@@ -297,7 +309,7 @@ class _ConsoleSpinner:
         self._stop.clear()
         # Fixed-width frames prevent remnants when cycling from ... back to .
         # Hide the terminal cursor for the duration of the transient spinner.
-        self._write("\x1b[?25lChecking.  ")
+        self._write(f"\x1b[?25l{self.label}.  ")
         self._thread = threading.Thread(target=self._run, name="nvme-doctor-spinner", daemon=True)
         try:
             self._thread.start()
@@ -307,7 +319,7 @@ class _ConsoleSpinner:
             raise
 
     def _run(self) -> None:
-        states = ("Checking.. ", "Checking...", "Checking.  ")
+        states = (f"{self.label}.. ", f"{self.label}...", f"{self.label}.  ")
         idx = 0
         while not self._stop.wait(self.interval):
             self._write("\r" + states[idx])
@@ -425,7 +437,7 @@ def command_check(args: argparse.Namespace, output: Optional[str] = None) -> int
         if progress and device != (args.device or device):
             progress(f"Resolved target to {device}")
         if explicit_direct and platform_key() != "darwin":
-            raise ValueError("--direct-usb is currently supported only on macOS with Realtek RTL9210 USB-NVMe bridges")
+            raise ValueError("--direct-usb is currently supported only on macOS external USB storage backends")
 
         auto_direct = (
             platform_key() == "darwin"
@@ -455,12 +467,99 @@ def command_check(args: argparse.Namespace, output: Optional[str] = None) -> int
     return _status_code(report.status)
 
 
+def _collect_all_topologies(progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Collect every discovered physical drive for merged topology output.
+
+    Per-device topology probes are independent, so collect them concurrently.
+    Unlike an explicit macOS device request, this inventory mode is always
+    non-disruptive: it never enables direct USB eject/capture automatically.
+    """
+    # macOS has an intentionally lightweight all-drive topology collector.
+    # Full discover_controllers() performs system_profiler + smartctl scans +
+    # per-device probes, and collect_topology() would then repeat much of that
+    # work.  Topology needs physical placement/identity, not SMART health, so
+    # avoid that expensive duplicate collection entirely.
+    if platform_key() == "darwin":
+        from .collect_macos import collect_all_topologies_macos
+        return collect_all_topologies_macos(progress=progress)
+
+    if progress:
+        progress("Discovering physical storage devices")
+    inventory = discover_controllers()
+    if not inventory:
+        return {
+            "platform": platform_key(),
+            "all_devices": True,
+            "devices": [],
+            "errors": [],
+            "complete": True,
+        }
+
+    devices: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    workers = min(8, max(1, len(inventory)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nvme-doctor-topology") as pool:
+        futures = {}
+        for item in inventory:
+            device = str(item.get("device") or item.get("controller") or "").strip()
+            if not device:
+                continue
+            futures[pool.submit(collect_topology, device, direct_usb=False)] = (device, item)
+        for future in as_completed(futures):
+            device, item = futures[future]
+            try:
+                topo = future.result()
+                # Discovery can have better quick identity than a topology probe
+                # that was intentionally non-privileged/non-disruptive. Preserve it.
+                ci = topo.setdefault("controller_info", {})
+                for src, dst in (("model", "model"), ("serial", "serial"), ("firmware", "firmware_rev"),
+                                 ("protocol", "protocol"), ("transport", "transport")):
+                    if not ci.get(dst) and item.get(src):
+                        ci[dst] = item.get(src)
+                devices.append(topo)
+            except Exception as exc:
+                errors.append({"device": device, "error": str(exc)})
+
+    def sort_key(topo: Dict[str, Any]):
+        name = str(topo.get("controller") or topo.get("controller_device") or "")
+        m = re.match(r"^(.*?)(\d+)$", name)
+        return (m.group(1) if m else name, int(m.group(2)) if m else -1, name)
+
+    devices.sort(key=sort_key)
+    errors.sort(key=lambda row: row.get("device", ""))
+    return {
+        "platform": platform_key(),
+        "all_devices": True,
+        "devices": devices,
+        "errors": errors,
+        "complete": not errors,
+    }
+
+
 def command_topology(args: argparse.Namespace) -> int:
-    device = _device_or_error(args.device)
     explicit_direct = bool(getattr(args, "direct_usb", False))
     if explicit_direct and platform_key() != "darwin":
-        raise ValueError("--direct-usb is currently supported only on macOS with Realtek RTL9210 USB-NVMe bridges")
+        raise ValueError("--direct-usb is currently supported only on macOS external USB storage backends")
 
+    if not args.device:
+        if explicit_direct:
+            raise ValueError("--direct-usb requires an explicit device; all-drive topology is non-disruptive")
+        human_console = not args.json
+        progress = _progress_callback(args)
+        spinner = None if (args.json or args.debug or getattr(args, "no_progress", False)) else _ConsoleSpinner(label="Collecting topology")
+        if spinner:
+            spinner.start()
+        try:
+            topology = _collect_all_topologies(progress=progress)
+        finally:
+            if spinner:
+                spinner.stop()
+        sys.stdout.write(render_topology_json(topology) if args.json else render_topology_all_text(topology))
+        if not topology.get("devices"):
+            return EXIT_WARNING
+        return EXIT_OK if topology.get("complete") else EXIT_INCOMPLETE
+
+    device = _device_or_error(args.device)
     topology = collect_topology(device, direct_usb=explicit_direct)
 
     if platform_key() == "darwin" and not explicit_direct:

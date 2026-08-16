@@ -1,3 +1,66 @@
+## 1.1.20
+
+- Make parameterless `nvme-doctor topology` show an immediate `Collecting topology...` spinner on human consoles; `topology --debug` exposes elapsed collection stages instead.
+- Replace the macOS all-drive topology path with a lightweight `diskutil` physical-disk collector. Topology no longer runs SMART health probes or repeatedly invokes `system_profiler` merely to draw the tree.
+- Fix a major macOS latency bug where all-drive topology performed expensive discovery and then repeated full per-device macOS snapshot collection, causing `system_profiler` and smartctl scans to run multiple times even with one internal SSD.
+- Classify internal Apple SSDs from fast diskutil transport/model evidence for all-drive topology, avoiding a slow `system_profiler SPNVMeDataType` round trip when it adds no topology detail.
+- Keep all-drive macOS topology non-disruptive and health-independent; explicit per-device topology behavior is unchanged.
+
+## 1.1.19
+
+- `nvme-doctor topology` with no device now discovers all physical drives and renders them in one merged hardware tree.
+- Shared NUMA, PCIe bridge and controller branches are deduplicated, so multiple SATA disks behind one AHCI controller appear as separate libata-port branches under the same controller.
+- USB storage is grouped by host/port/bridge without guessing the underlying ATA/NVMe protocol.
+- All-drive topology collection runs per-device probes concurrently and remains non-disruptive on macOS; direct USB capture still requires an explicit device.
+- `topology --json` without a device returns the per-drive topology records plus any collection errors.
+
+## 1.1.18
+
+- Linux ATA/SATA topology now shows the per-disk libata port (`ataN`), SCSI host and SCSI address beneath a shared AHCI controller.
+- Two SATA disks on the same PCI AHCI controller no longer appear to occupy the same host-side location.
+- The `ataN` value is labeled as a Linux libata port rather than a physical chassis connector number.
+
+## 1.1.17
+
+- Fixed SATA topology wording so a SATA drive is never described as having a PCIe Gen link.
+- Native ATA paths now distinguish the AHCI controller's host-side PCIe link from the drive-side SATA link.
+- Added an explicit SATA link node plus `Drive SATA link` summary when smartctl reports interface speed.
+- Replaced ATA `Endpoint link`/`PCI endpoint` labels with `Host PCIe link`/`Host controller`.
+- Added regression coverage for a Gen5 x16 AHCI controller hosting a 6.0 Gb/s SATA SSD.
+
+## 1.1.16
+
+- Fix `topology` for non-NVMe disks: native Linux ATA/SATA `sdX` devices are no longer rendered as USB/SCSI bridges containing an NVMe SSD.
+- Resolve native Linux libata block-device ancestry back to the actual PCI SATA/AHCI controller and show the host PCI/NUMA path when available.
+- Render USB storage leaves by confirmed protocol (`ATA/SATA drive`, `NVMe SSD`, `SCSI disk`, or generic storage device) instead of assuming every translated block device is NVMe.
+- Use udev/sysfs identity and libata path evidence when an unprivileged smartctl identity probe fails; topology no longer tells SATA users to rerun for “NVMe identity”.
+- Make topology notes and path summaries protocol-aware on Linux and macOS, including USB-to-SATA devices.
+- Add regressions for native Solidigm-style SATA `/dev/sda` topology and macOS USB-SATA topology.
+
+## 1.1.15
+
+- Prefer smartctl's automatic device detection for macOS USB-SATA disks before forcing `-d sat`; observed UGREEN USB-C/SATA bridges expose full ATA SMART with plain smartctl even when explicit SAT mode fails.
+- `list` can now report `GOOD/WARN/FAIL` for macOS USB-SATA devices when discovery has already proven a fast, non-disruptive smartctl backend; direct/eject USB access is still never used by `list`.
+- Recover USB Mass Storage Bulk-Only Transport after switching UAS-capable USB-SATA bridges to their BOT fallback alternate setting.
+- Perform the standard Bulk-Only Mass Storage Reset and clear both bulk endpoint halts before SAT commands and between failed SAT16/SAT12 attempts.
+- Verify BOT responsiveness with standard SCSI INQUIRY before issuing ATA PASS THROUGH, so transport failure is distinguished from unsupported SAT.
+- Preserve UAS-vs-BOT-fallback details in direct USB-SATA bridge evidence.
+
+## 1.1.14
+
+- Added a macOS direct USB-SATA SAT fallback for positively identified ATA/SATA SSDs when Darwin smartctl cannot access SMART through the enclosure.
+- The direct path uses safe whole-disk eject/restore plus libusb BOT and read-only ATA PASS THROUGH(16) for IDENTIFY, SMART data, thresholds, and SMART RETURN STATUS when available.
+- Direct SAT refuses ambiguous USB mappings and falls back to `INCOMPLETE` without guessing when the enclosure does not support the required path.
+- Direct ATA parsing no longer assigns Solidigm-specific meanings to vendor SMART IDs on unrelated drives; unknown vendor attributes remain raw by ID.
+- ATA assessment no longer says SMART overall-health passed when an overall SMART status was not actually obtained; it reports collected attributes/threshold state instead.
+
+## 1.1.13
+
+- Fixed macOS USB SSD protocol fallback: a failed `smartctl -d sat` probe no longer automatically turns every external SSD into an NVMe/SNT candidate.
+- Added conservative USB media protocol hints from explicit identity strings; WD/SanDisk SA510 is correctly retained as ATA/SATA when its USB bridge hides SAT SMART.
+- macOS USB-SATA checks with unavailable SMART now report `INCOMPLETE` with ATA/SATA-specific capabilities and recommendations instead of misleading NVMe/SNT passthrough text.
+- macOS `list` keeps such drives as `ATA` / `USB -> SATA`; quick health remains `-` when SMART is not non-disruptively available.
+
 ## 1.1.12
 
 - `check` now rejects nonexistent device nodes before any SMART/NVMe probing.

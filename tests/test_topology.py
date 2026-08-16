@@ -209,3 +209,316 @@ def test_macos_collect_topology_uses_snapshot_device_path(monkeypatch):
     assert topo["controller_device"] == "/dev/disk4"
     assert topo["namespaces"][0]["device"] == "/dev/disk4"
     assert topo["controller_info"]["model"] == "Samsung SSD 990 EVO Plus 2TB"
+
+class NativeSataTopologyRunner:
+    def run(self, argv, timeout=8.0):
+        if argv[:2] in (["smartctl", "--scan-open"], ["smartctl", "--scan"]):
+            return CommandResult(list(argv), 0, stdout="")
+        if argv and argv[0] == "smartctl":
+            # Reproduce a non-root/ambiguous identity probe: topology must still
+            # use authoritative Linux libata + udev/sysfs evidence and must not
+            # relabel the drive as USB/NVMe.
+            return CommandResult(list(argv), 2, stdout="{}\n")
+        if argv[:2] == ["udevadm", "info"]:
+            return CommandResult(
+                list(argv), 0,
+                stdout=(
+                    "ID_BUS=ata\n"
+                    "ID_MODEL=SOLIDIGM_SSDSC2KB019TZ\n"
+                    "ID_SERIAL_SHORT=BTYI549203JJ1P9DGN\n"
+                    "ID_REVISION=7CV10130\n"
+                ),
+            )
+        if argv and argv[0] == "lspci":
+            bdf = argv[-1]
+            desc = {
+                "0000:00:03.1": "PCI bridge: Example Root Port",
+                "0000:41:00.0": "SATA controller: Example AHCI Controller",
+            }.get(bdf, "PCI device")
+            return CommandResult(list(argv), 0, stdout=f"{bdf} {desc}\n")
+        return CommandResult(list(argv), 127, available=False)
+
+
+def test_native_sata_topology_is_not_rendered_as_usb_nvme(tmp_path):
+    devices = tmp_path / "devices" / "pci0000:00"
+    root = devices / "0000:00:03.1"
+    sata = root / "0000:41:00.0"
+    ata_leaf = sata / "ata3" / "host3" / "target3:0:0" / "3:0:0:0"
+    ata_leaf.mkdir(parents=True)
+    _make_pci_node(root, cls="0x060400", speed="16.0 GT/s PCIe", width="4")
+    _make_pci_node(sata, cls="0x010601", speed="8.0 GT/s PCIe", width="1")
+
+    sys_pci = tmp_path / "sys_pci"
+    sys_pci.mkdir()
+    (sys_pci / "0000:00:03.1").symlink_to(root, target_is_directory=True)
+    (sys_pci / "0000:41:00.0").symlink_to(sata, target_is_directory=True)
+
+    sys_block = tmp_path / "sys_block"
+    block = sys_block / "sda"
+    block.mkdir(parents=True)
+    (block / "device").symlink_to(ata_leaf, target_is_directory=True)
+    _write(block / "device" / "type", "0")
+    _write(block / "device" / "model", "SSDSC2KB019TZ")
+    _write(block / "device" / "vendor", "SOLIDIGM")
+    _write(block / "device" / "rev", "7CV10130")
+    _write(block / "device" / "state", "running")
+    _write(block / "queue" / "rotational", "0")
+    _write(block / "size", "3750748848")
+    _write(block / "queue" / "logical_block_size", "512")
+
+    topo = collect_topology_linux(
+        "sda",
+        runner=NativeSataTopologyRunner(),
+        sys_pci=sys_pci,
+        sys_class_block=sys_block,
+    )
+    ci = topo["controller_info"]
+    assert ci["protocol"] == "ATA"
+    assert ci["transport"] == "SATA"
+    assert ci["model"] == "SOLIDIGM SSDSC2KB019TZ"
+    assert topo["pci_endpoint"]["bdf"] == "0000:41:00.0"
+    assert topo["pci_path"][-1]["role"] == "SATA/AHCI controller"
+
+    text = render_topology_text(topo)
+    assert "SATA/AHCI controller" in text
+    assert "/dev/sda" in text
+    assert "NVMe SSD" not in text
+    assert "USB/SCSI bridge" not in text
+    assert "native NVMe PCIe endpoint" not in text
+    assert "rerun with sudo for NVMe identity" not in text
+    assert "Namespace count" not in text
+    assert "Block device         /dev/sda" in text
+
+def test_macos_usb_sata_topology_uses_ata_not_nvme_wording(monkeypatch):
+    from src.model import Snapshot
+    import src.collect_macos as collect_macos
+
+    snap = Snapshot("disk4", "disk4", "/dev/disk4")
+    snap.controller_info = {
+        "model": "WD Blue SA510 2.5 2TB",
+        "serial": "23074M442603",
+        "firmware_rev": "530309WD",
+        "protocol": "ATA",
+        "transport": "USB -> SATA",
+        "size_in_bytes": 2_000_398_934_016,
+    }
+    monkeypatch.setattr(
+        collect_macos,
+        "collect_snapshot_macos",
+        lambda requested_device, runner=None, kernel_lines=0, direct_usb=False: snap,
+    )
+
+    topo = collect_topology("disk4", platform_name="darwin")
+    text = render_topology_text(topo)
+    assert "ATA/SATA drive — WD Blue SA510 2.5 2TB" in text
+    assert "USB-to-SATA bridge" in text
+    assert "NVMe SSD" not in text
+    assert "USB-to-NVMe" not in text
+    assert "PCIe/NUMA/AER" not in text
+
+class NativeSataSmartctlTopologyRunner(NativeSataTopologyRunner):
+    def run(self, argv, timeout=8.0):
+        if argv and argv[0] == "smartctl" and "-i" in argv:
+            return CommandResult(
+                list(argv), 0,
+                stdout='''{
+  "device": {"name": "/dev/sda", "type": "sat", "protocol": "ATA"},
+  "model_name": "SOLIDIGM SSDSC2KB019TZ",
+  "serial_number": "BTYI549203JJ1P9DGN",
+  "firmware_version": "7CV10130",
+  "sata_version": {"string": "SATA 3.3, 6.0 Gb/s"},
+  "interface_speed": {
+    "max": {"sata_value": 3, "string": "6.0 Gb/s"},
+    "current": {"sata_value": 3, "string": "6.0 Gb/s"}
+  }
+}\n''',
+            )
+        return super().run(argv, timeout=timeout)
+
+
+def test_native_sata_topology_distinguishes_host_pcie_from_drive_sata_link(tmp_path):
+    devices = tmp_path / "devices" / "pci0000:00"
+    root = devices / "0000:70:07.2"
+    sata = root / "0000:73:00.0"
+    ata_leaf = sata / "ata3" / "host3" / "target3:0:0" / "3:0:0:0"
+    ata_leaf.mkdir(parents=True)
+    _make_pci_node(root, cls="0x060400", speed="32.0 GT/s PCIe", width="16")
+    _make_pci_node(sata, cls="0x010601", speed="32.0 GT/s PCIe", width="16")
+
+    sys_pci = tmp_path / "sys_pci"
+    sys_pci.mkdir()
+    (sys_pci / "0000:70:07.2").symlink_to(root, target_is_directory=True)
+    (sys_pci / "0000:73:00.0").symlink_to(sata, target_is_directory=True)
+
+    sys_block = tmp_path / "sys_block"
+    block = sys_block / "sda"
+    block.mkdir(parents=True)
+    (block / "device").symlink_to(ata_leaf, target_is_directory=True)
+    _write(block / "device" / "type", "0")
+    _write(block / "device" / "model", "SSDSC2KB019TZ")
+    _write(block / "device" / "vendor", "SOLIDIGM")
+    _write(block / "device" / "rev", "7CV10130")
+    _write(block / "device" / "state", "running")
+    _write(block / "queue" / "rotational", "0")
+    _write(block / "size", "3750748848")
+    _write(block / "queue" / "logical_block_size", "512")
+
+    topo = collect_topology_linux(
+        "sda",
+        runner=NativeSataSmartctlTopologyRunner(),
+        sys_pci=sys_pci,
+        sys_class_block=sys_block,
+    )
+    text = render_topology_text(topo)
+    assert "host PCIe Gen5 x16" in text
+    assert "SATA link — 6.0 Gb/s" in text
+    assert "Host PCIe link       Gen5 x16" in text
+    assert "Drive SATA link      6.0 Gb/s" in text
+    assert "Host controller      0000:73:00.0" in text
+    assert "libata port ata3 — host3" in text
+    assert "SCSI address 3:0:0:0" in text
+    assert "libata port          ata3 (host3)" in text
+    assert "Endpoint link        Gen5 x16" not in text
+    assert "at device maximum" not in text
+
+class TwoNativeSataRunner(NativeSataTopologyRunner):
+    def run(self, argv, timeout=8.0):
+        if argv and argv[0] == "smartctl" and "-i" in argv:
+            dev = argv[-1]
+            model = "SOLIDIGM SSDSC2KB019TZ" if dev.endswith("sda") else "SOLIDIGM SSDSC2KB076TZ"
+            serial = "SER-A" if dev.endswith("sda") else "SER-B"
+            return CommandResult(
+                list(argv), 0,
+                stdout=(
+                    '{"device":{"name":"%s","type":"sat","protocol":"ATA"},'
+                    '"model_name":"%s","serial_number":"%s","firmware_version":"7CV10130",'
+                    '"sata_version":{"string":"SATA 3.3, 6.0 Gb/s"},'
+                    '"interface_speed":{"max":{"string":"6.0 Gb/s"},"current":{"string":"6.0 Gb/s"}}}\n'
+                ) % (dev, model, serial),
+            )
+        return super().run(argv, timeout=timeout)
+
+
+def test_two_sata_disks_share_ahci_controller_but_show_distinct_libata_ports(tmp_path):
+    devices = tmp_path / "devices" / "pci0000:00"
+    root = devices / "0000:70:07.2"
+    sata = root / "0000:73:00.0"
+    leaf_a = sata / "ata3" / "host3" / "target3:0:0" / "3:0:0:0"
+    leaf_b = sata / "ata4" / "host4" / "target4:0:0" / "4:0:0:0"
+    leaf_a.mkdir(parents=True)
+    leaf_b.mkdir(parents=True)
+    _make_pci_node(root, cls="0x060400", speed="32.0 GT/s PCIe", width="16")
+    _make_pci_node(sata, cls="0x010601", speed="32.0 GT/s PCIe", width="16")
+
+    sys_pci = tmp_path / "sys_pci"
+    sys_pci.mkdir()
+    (sys_pci / "0000:70:07.2").symlink_to(root, target_is_directory=True)
+    (sys_pci / "0000:73:00.0").symlink_to(sata, target_is_directory=True)
+
+    sys_block = tmp_path / "sys_block"
+    for name, leaf, model, sectors in [
+        ("sda", leaf_a, "SSDSC2KB019TZ", "3750748848"),
+        ("sdb", leaf_b, "SSDSC2KB076TZ", "15002992640"),
+    ]:
+        block = sys_block / name
+        block.mkdir(parents=True)
+        (block / "device").symlink_to(leaf, target_is_directory=True)
+        _write(block / "device" / "type", "0")
+        _write(block / "device" / "model", model)
+        _write(block / "device" / "vendor", "SOLIDIGM")
+        _write(block / "device" / "rev", "7CV10130")
+        _write(block / "device" / "state", "running")
+        _write(block / "queue" / "rotational", "0")
+        _write(block / "size", sectors)
+        _write(block / "queue" / "logical_block_size", "512")
+
+    runner = TwoNativeSataRunner()
+    topo_a = collect_topology_linux("sda", runner=runner, sys_pci=sys_pci, sys_class_block=sys_block)
+    topo_b = collect_topology_linux("sdb", runner=runner, sys_pci=sys_pci, sys_class_block=sys_block)
+
+    assert topo_a["pci_endpoint"]["bdf"] == topo_b["pci_endpoint"]["bdf"] == "0000:73:00.0"
+    assert topo_a["controller_info"]["ata_port"] == "ata3"
+    assert topo_b["controller_info"]["ata_port"] == "ata4"
+    assert topo_a["controller_info"]["scsi_lun"] == "3:0:0:0"
+    assert topo_b["controller_info"]["scsi_lun"] == "4:0:0:0"
+
+    text_a = render_topology_text(topo_a)
+    text_b = render_topology_text(topo_b)
+    assert "libata port ata3 — host3" in text_a
+    assert "SCSI address 3:0:0:0" in text_a
+    assert "libata port          ata3 (host3)" in text_a
+    assert "libata port ata4 — host4" in text_b
+    assert "SCSI address 4:0:0:0" in text_b
+    assert "libata port          ata4 (host4)" in text_b
+
+
+def test_all_topology_merges_shared_ahci_controller_into_one_tree():
+    from src.render import render_topology_all_text
+
+    def sata(dev, port, host, lun, model, capacity):
+        return {
+            "platform": "linux",
+            "controller": dev,
+            "controller_device": f"/dev/{dev}",
+            "controller_info": {
+                "protocol": "ATA",
+                "transport": "SATA",
+                "model": model,
+                "ata_port": port,
+                "scsi_host": host,
+                "scsi_lun": lun,
+                "interface_speed": {"current": {"string": "6.0 Gb/s"}},
+            },
+            "numa_node": "0",
+            "local_cpulist": "0-7,64-71",
+            "pci_domain": "0000",
+            "pci_path": [
+                {
+                    "bdf": "0000:70:07.2",
+                    "role": "PCIe bridge / port",
+                    "description": "AMD Turin Internal PCIe GPP Bridge",
+                    "current_link_speed": "32.0 GT/s PCIe",
+                    "current_link_width": "16",
+                },
+                {
+                    "bdf": "0000:73:00.0",
+                    "role": "SATA/AHCI controller",
+                    "description": "AMD FCH SATA Controller",
+                    "current_link_speed": "32.0 GT/s PCIe",
+                    "current_link_width": "16",
+                    "driver": "ahci",
+                },
+            ],
+            "namespaces": [{
+                "device": f"/dev/{dev}",
+                "capacity_bytes": capacity,
+                "logical_block_size": 512,
+            }],
+            "complete": True,
+            "notes": [],
+        }
+
+    all_topo = {
+        "platform": "linux",
+        "all_devices": True,
+        "devices": [
+            sata("sda", "ata3", "host3", "3:0:0:0", "SOLIDIGM SSDSC2KB019TZ", 1_920_000_000_000),
+            sata("sdb", "ata4", "host4", "4:0:0:0", "SOLIDIGM SSDSC2KB076TZ", 7_680_000_000_000),
+        ],
+        "errors": [],
+        "complete": True,
+    }
+    text = render_topology_all_text(all_topo)
+    assert text.count("0000:73:00.0  SATA/AHCI controller") == 1
+    assert "├─ libata port ata3 — host3" in text
+    assert "└─ libata port ata4 — host4" in text
+    assert "/dev/sda — SOLIDIGM SSDSC2KB019TZ" in text
+    assert "/dev/sdb — SOLIDIGM SSDSC2KB076TZ" in text
+    assert "SATA link — 6.0 Gb/s" in text
+
+
+def test_topology_parser_allows_no_device_for_all_drive_tree():
+    from src import cli
+    args = cli.build_parser().parse_args(["topology"])
+    assert args.command == "topology"
+    assert args.device is None

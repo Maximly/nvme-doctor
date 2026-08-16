@@ -325,7 +325,10 @@ def render_text(report: Report, verbose: bool = False) -> str:
                     text += f" (max {_v(maxv)})"
                 lines.append(f"  SATA link            {text}")
     if ci.get("smartctl_device_type") and str(ci.get("smartctl_device_type")).lower().startswith(("snt", "sat")):
-        lines.append(f"  Bridge backend       {ci.get('smartctl_device_type')}")
+        backend = str(ci.get("smartctl_device_type"))
+        if backend.lower() == "sat-direct":
+            backend = "direct SAT (BOT)"
+        lines.append(f"  Bridge backend       {backend}")
     usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
     if usb:
         if usb.get("vid_pid"):
@@ -474,6 +477,26 @@ def render_json(report: Report, pretty: bool = True) -> str:
     return json.dumps(report.to_dict(), indent=2 if pretty else None, sort_keys=False) + "\n"
 
 
+def _ata_sata_link_text(ci: Dict[str, Any]) -> Optional[str]:
+    """Return drive-side SATA link text without confusing it with host PCIe."""
+    iface = ci.get("interface_speed")
+    if not isinstance(iface, dict):
+        return None
+
+    def _speed(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            value = value.get("string") or value.get("value")
+        if value in (None, ""):
+            return None
+        return str(value)
+
+    current = _speed(iface.get("current"))
+    maximum = _speed(iface.get("max"))
+    if current and maximum and current != maximum:
+        return f"{current} (max {maximum})"
+    return current or maximum
+
+
 def _topology_link_text(node: Dict[str, Any]) -> Optional[str]:
     cur_speed = node.get("current_link_speed")
     cur_width = node.get("current_link_width")
@@ -517,7 +540,7 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
     model = ci.get("model") or ci.get("model_name") or "-"
     lines.append(f"Controller           {topology.get('controller') or '-'}")
     if model == "-" and ci.get("identity_note"):
-        lines.append("Model                unavailable (rerun with sudo for NVMe identity)")
+        lines.append("Model                unavailable (storage identity not readable)")
     else:
         lines.append(f"Model                {model}")
     if ci.get("serial"):
@@ -534,9 +557,17 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
     platform_name = topology.get("platform")
     numa = topology.get("numa_node")
     cpus = topology.get("local_cpulist")
-    usb_translated = bool(ci.get("native_nvme") is False or ci.get("usb_bridge") or ci.get("usb_bridge_model"))
+    transport_text = str(ci.get("transport") or "")
+    protocol = str(ci.get("protocol") or "").upper()
+    usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
+    usb_translated = bool(
+        transport_text.upper().startswith("USB")
+        or ci.get("usb_bridge")
+        or ci.get("usb_bridge_model")
+        or usb.get("usb_port")
+        or usb.get("vid_pid")
+    )
     if usb_translated:
-        usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
         host = "Host USB storage path"
         if usb.get("host_controller_bdf") or usb.get("host_controller_driver"):
             host_bits = [usb.get("host_controller_bdf"), usb.get("host_controller_driver")]
@@ -561,8 +592,22 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
             hw = " ".join(str(x) for x in (usb.get("manufacturer"), usb.get("product")) if x).strip()
             bridge = f"{usb.get('vid_pid')}" + (f" {hw}" if hw else f" {bridge}")
         lines.append(f"{prefix}{bridge}")
-        nvme_model = model if model != "-" else "underlying NVMe identity unavailable"
-        lines.append(f"      └─ NVMe SSD — {nvme_model}")
+        if not protocol:
+            upper_transport = transport_text.upper()
+            if "NVME" in upper_transport:
+                protocol = "NVME"
+            elif "SATA" in upper_transport or "ATA" in upper_transport:
+                protocol = "ATA"
+        device_model = model if model != "-" else "identity unavailable"
+        if protocol == "NVME":
+            leaf = f"NVMe SSD — {device_model}"
+        elif protocol == "ATA":
+            leaf = f"ATA/SATA drive — {device_model}"
+        elif protocol == "SCSI":
+            leaf = f"SCSI disk — {device_model}"
+        else:
+            leaf = f"storage device — {device_model}"
+        lines.append(f"      └─ {leaf}")
         namespaces = topology.get("namespaces") or []
         if namespaces:
             for idx, ns in enumerate(namespaces):
@@ -608,7 +653,10 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
             details: List[str] = []
             link = _topology_link_text(node)
             if link:
-                details.append(link)
+                if protocol == "ATA" and is_last_pci:
+                    details.append(f"host PCIe {link}")
+                else:
+                    details.append(link)
             if node.get("driver"):
                 details.append(f"driver {node.get('driver')}")
             if node.get("power_state"):
@@ -620,6 +668,24 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
             # All descendants after a PCI node are indented beneath it.  We do
             # not try to draw sibling switch branches because this command only
             # displays the selected device's path.
+            indent += "   "
+
+        if protocol == "ATA":
+            ata_port = ci.get("ata_port")
+            scsi_host = ci.get("scsi_host")
+            scsi_lun = ci.get("scsi_lun")
+            if ata_port:
+                port_label = f"libata port {ata_port}"
+                if scsi_host:
+                    port_label += f" — {scsi_host}"
+                lines.append(f"{indent}└─ {port_label}")
+                indent += "   "
+            if scsi_lun:
+                lines.append(f"{indent}└─ SCSI address {scsi_lun}")
+                indent += "   "
+            sata_link = _ata_sata_link_text(ci)
+            sata_label = "SATA link" + (f" — {sata_link}" if sata_link else "")
+            lines.append(f"{indent}└─ {sata_label}")
             indent += "   "
 
         namespaces = topology.get("namespaces") or []
@@ -656,7 +722,21 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
             cur_width is not None and max_width is not None and cur_width < max_width
         )
         if endpoint_link:
-            lines.append(f"  Endpoint link        {endpoint_link} — {'DOWN-TRAINED' if endpoint_down else 'at device maximum'}")
+            if protocol == "ATA":
+                lines.append(f"  Host PCIe link       {endpoint_link} — AHCI controller interconnect, not the SATA drive link")
+            else:
+                lines.append(f"  Endpoint link        {endpoint_link} — {'DOWN-TRAINED' if endpoint_down else 'at device maximum'}")
+        if protocol == "ATA":
+            if ci.get("ata_port"):
+                port_summary = str(ci.get("ata_port"))
+                if ci.get("scsi_host"):
+                    port_summary += f" ({ci.get('scsi_host')})"
+                lines.append(f"  libata port          {port_summary}")
+            if ci.get("scsi_lun"):
+                lines.append(f"  SCSI address         {ci.get('scsi_lun')}")
+            sata_link = _ata_sata_link_text(ci)
+            if sata_link:
+                lines.append(f"  Drive SATA link      {sata_link}")
 
         downtrained = []
         for node in topology.get("pci_path") or []:
@@ -668,11 +748,15 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
                     (cw is not None and mw is not None and cw < mw)):
                 downtrained.append(f"{node.get('bdf')}: {_topology_link_text(node) or 'link below maximum'}")
         if downtrained:
-            lines.append(f"  Down-trained hops    {len(downtrained)}")
+            label = "Host PCIe down-train" if protocol == "ATA" else "Down-trained hops"
+            lines.append(f"  {label:<20} {len(downtrained)}")
             for item in downtrained:
                 lines.append(f"                       - {item}")
         else:
-            lines.append("  Down-trained hops    none detected")
+            if protocol == "ATA":
+                lines.append("  Host PCIe down-train none detected")
+            else:
+                lines.append("  Down-trained hops    none detected")
         if topology.get("numa_node") not in (None, "-1"):
             locality = f"NUMA {topology.get('numa_node')}"
             if topology.get("local_cpulist"):
@@ -684,13 +768,40 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
         lines.append(f"  NUMA node            {_v(topology.get('numa_node'), 'unknown')}")
         if topology.get("local_cpulist"):
             lines.append(f"  Local CPUs           {topology.get('local_cpulist')}")
-        lines.append(f"  PCI endpoint         {_v(endpoint.get('bdf'))}")
+        if protocol == "ATA":
+            lines.append(f"  Host controller      {_v(endpoint.get('bdf'))}")
+        else:
+            lines.append(f"  PCI endpoint         {_v(endpoint.get('bdf'))}")
         link = _topology_link_text(endpoint)
         if link:
-            lines.append(f"  Endpoint link        {link}")
+            if protocol == "ATA":
+                lines.append(f"  Host PCIe link       {link}")
+            else:
+                lines.append(f"  Endpoint link        {link}")
+        if protocol == "ATA":
+            if ci.get("ata_port"):
+                port_summary = str(ci.get("ata_port"))
+                if ci.get("scsi_host"):
+                    port_summary += f" ({ci.get('scsi_host')})"
+                lines.append(f"  libata port          {port_summary}")
+            if ci.get("scsi_lun"):
+                lines.append(f"  SCSI address         {ci.get('scsi_lun')}")
+            sata_link = _ata_sata_link_text(ci)
+            if sata_link:
+                lines.append(f"  Drive SATA link      {sata_link}")
         if endpoint.get("driver"):
             lines.append(f"  Driver               {endpoint.get('driver')}")
-        lines.append(f"  Namespace count      {len(topology.get('namespaces') or [])}")
+        devices = topology.get("namespaces") or []
+        if protocol == "NVME":
+            lines.append(f"  Namespace count      {len(devices)}")
+        elif devices:
+            lines.append(f"  Block device         {devices[0].get('device') or topology.get('controller_device') or topology.get('controller')}")
+        if protocol == "ATA":
+            sata = ci.get("sata_version")
+            if isinstance(sata, dict):
+                sata = sata.get("string") or sata.get("value")
+            if sata:
+                lines.append(f"  SATA version          {sata}")
 
     notes = topology.get("notes") or []
     if notes:
@@ -700,6 +811,192 @@ def render_topology_text(topology: Dict[str, Any]) -> str:
             lines.append(f"  - {note}")
     return "\n".join(lines) + "\n"
 
+
+
+def _tree_node(label: str, details: Optional[str] = None) -> Dict[str, Any]:
+    return {"label": label, "details": details, "children": {}}
+
+
+def _tree_child(parent: Dict[str, Any], key: str, label: str, details: Optional[str] = None) -> Dict[str, Any]:
+    children = parent.setdefault("children", {})
+    if key not in children:
+        children[key] = _tree_node(label, details)
+    else:
+        # Keep the first stable label, but fill details if an earlier path did
+        # not have them. Shared controller/bridge branches are intentionally
+        # merged across drives.
+        if details and not children[key].get("details"):
+            children[key]["details"] = details
+    return children[key]
+
+
+def _topology_leaf_label(topo: Dict[str, Any], ns: Dict[str, Any], *, include_model: bool = True) -> str:
+    ci = topo.get("controller_info") or {}
+    label = str(ns.get("device") or ns.get("name") or topo.get("controller_device") or topo.get("controller") or "disk")
+    model = ci.get("model") or ci.get("model_name")
+    if include_model and model:
+        label += f" — {model}"
+    extra: List[str] = []
+    if ns.get("nsid") is not None:
+        extra.append(f"NSID {ns.get('nsid')}")
+    if ns.get("capacity_bytes") is not None:
+        extra.append(format_bytes_decimal(to_int(ns.get("capacity_bytes"))) or str(ns.get("capacity_bytes")))
+    if ns.get("logical_block_size") is not None:
+        extra.append(f"LBA {ns.get('logical_block_size')} B")
+    if extra:
+        label += "  [" + ", ".join(extra) + "]"
+    return label
+
+
+def _render_tree_lines(node: Dict[str, Any], prefix: str = "") -> List[str]:
+    children = list((node.get("children") or {}).values())
+    out: List[str] = []
+    for idx, child in enumerate(children):
+        last = idx == len(children) - 1
+        branch = "└─ " if last else "├─ "
+        out.append(prefix + branch + str(child.get("label") or "-"))
+        if child.get("details"):
+            detail_prefix = prefix + ("   " if last else "│  ")
+            out.append(detail_prefix + "   " + str(child.get("details")))
+        next_prefix = prefix + ("   " if last else "│  ")
+        out.extend(_render_tree_lines(child, next_prefix))
+    return out
+
+
+def render_topology_all_text(topology: Dict[str, Any]) -> str:
+    """Render all discovered physical storage devices as one merged tree."""
+    devices = topology.get("devices") or []
+    lines: List[str] = ["NVMe Doctor  |  TOPOLOGY", "", f"Drives               {len(devices)}", "", "HARDWARE TREE"]
+    if not devices:
+        lines.append("No supported physical storage devices found.")
+        return "\n".join(lines) + "\n"
+
+    root = _tree_node("Storage")
+    for topo in devices:
+        ci = topo.get("controller_info") or {}
+        platform_name = str(topo.get("platform") or topology.get("platform") or "")
+        protocol = str(ci.get("protocol") or "").upper()
+        transport = str(ci.get("transport") or "")
+        usb = ci.get("usb_path") if isinstance(ci.get("usb_path"), dict) else {}
+        usb_translated = bool(
+            transport.upper().startswith("USB") or ci.get("usb_bridge") or ci.get("usb_bridge_model")
+            or usb.get("usb_port") or usb.get("vid_pid")
+        )
+        namespaces = topo.get("namespaces") or [{"device": topo.get("controller_device") or topo.get("controller")}]
+
+        if usb_translated:
+            usb_root = _tree_child(root, "root:usb", "USB storage")
+            host_id = str(usb.get("host_controller_bdf") or usb.get("host_controller_driver") or "host")
+            host_bits = [usb.get("host_controller_bdf"), usb.get("host_controller_driver")]
+            host_label = "USB host" + ((" — " + " ".join(str(x) for x in host_bits if x)) if any(host_bits) else "")
+            parent = _tree_child(usb_root, f"host:{host_id}", host_label)
+
+            port_id = str(usb.get("usb_port") or topo.get("controller") or topo.get("controller_device") or "port")
+            port_bits: List[str] = []
+            if usb.get("usb_port"):
+                port_bits.append(str(usb.get("usb_port")))
+            if usb.get("usb_version"):
+                port_bits.append(f"USB {usb.get('usb_version')}")
+            if usb.get("speed_mbps") is not None:
+                port_bits.append(f"{usb.get('speed_mbps')} Mb/s")
+            if usb.get("interface_driver"):
+                port_bits.append(str(usb.get("interface_driver")))
+            port_label = " — ".join(port_bits) if port_bits else f"USB path for {topo.get('controller') or '-'}"
+            parent = _tree_child(parent, f"port:{port_id}", port_label)
+
+            bridge_id = str(usb.get("vid_pid") or ci.get("usb_bridge_model") or ci.get("usb_bridge") or port_id)
+            hw = " ".join(str(x) for x in (usb.get("manufacturer"), usb.get("product")) if x).strip()
+            bridge_label = str(usb.get("vid_pid") or "USB/SCSI bridge")
+            if hw:
+                bridge_label += f" {hw}"
+            elif ci.get("usb_bridge_model") or ci.get("usb_bridge"):
+                bridge_label += " — " + " — ".join(str(x) for x in (ci.get("usb_bridge_model"), ci.get("usb_bridge")) if x)
+            parent = _tree_child(parent, f"bridge:{bridge_id}", bridge_label)
+
+            model = ci.get("model") or ci.get("model_name") or "identity unavailable"
+            if protocol == "ATA":
+                drive_label = f"ATA/SATA drive — {model}"
+            elif protocol == "NVME":
+                drive_label = f"NVMe SSD — {model}"
+            elif protocol == "SCSI":
+                drive_label = f"SCSI disk — {model}"
+            else:
+                drive_label = f"storage device — {model}"
+            drive_key = f"drive:{ci.get('serial') or topo.get('controller_device') or topo.get('controller')}"
+            parent = _tree_child(parent, drive_key, drive_label)
+            for ns in namespaces:
+                leaf = _topology_leaf_label(topo, ns, include_model=False)
+                _tree_child(parent, f"leaf:{ns.get('device') or ns.get('name') or leaf}", leaf)
+            continue
+
+        if platform_name == "linux" and topo.get("pci_path"):
+            numa = topo.get("numa_node")
+            cpus = topo.get("local_cpulist")
+            if numa not in (None, "-1"):
+                root_label = f"NUMA node {numa}" + (f"  [local CPUs {cpus}]" if cpus else "")
+                parent = _tree_child(root, f"numa:{numa}", root_label)
+            else:
+                parent = _tree_child(root, "numa:unknown", "NUMA locality unknown")
+            domain = topo.get("pci_domain") or "unknown"
+            parent = _tree_child(parent, f"domain:{domain}", f"PCI domain {domain}")
+
+            pci_path = topo.get("pci_path") or []
+            for idx, node in enumerate(pci_path):
+                bdf = str(node.get("bdf") or f"pci-{idx}")
+                role = node.get("role") or "PCI device"
+                desc = node.get("description")
+                label = f"{bdf}  {role}" + (f" — {desc}" if desc else "")
+                detail_bits: List[str] = []
+                link = _topology_link_text(node)
+                if link:
+                    if protocol == "ATA" and idx == len(pci_path) - 1:
+                        detail_bits.append(f"host PCIe {link}")
+                    else:
+                        detail_bits.append(link)
+                if node.get("driver"):
+                    detail_bits.append(f"driver {node.get('driver')}")
+                if node.get("power_state"):
+                    detail_bits.append(f"power {node.get('power_state')}")
+                parent = _tree_child(parent, f"pci:{bdf}", label, "; ".join(detail_bits) or None)
+
+            if protocol == "ATA":
+                ata_port = ci.get("ata_port")
+                scsi_host = ci.get("scsi_host")
+                scsi_lun = ci.get("scsi_lun")
+                if ata_port:
+                    label = f"libata port {ata_port}" + (f" — {scsi_host}" if scsi_host else "")
+                    parent = _tree_child(parent, f"ata:{ata_port}:{scsi_host or ''}", label)
+                if scsi_lun:
+                    parent = _tree_child(parent, f"scsi:{scsi_lun}", f"SCSI address {scsi_lun}")
+                sata_link = _ata_sata_link_text(ci)
+                parent = _tree_child(parent, f"sata-link:{ata_port or scsi_lun or topo.get('controller')}",
+                                     "SATA link" + (f" — {sata_link}" if sata_link else ""))
+
+            for ns in namespaces:
+                leaf = _topology_leaf_label(topo, ns, include_model=True)
+                _tree_child(parent, f"leaf:{ns.get('device') or ns.get('name') or leaf}", leaf)
+            continue
+
+        # macOS native storage or Linux storage without a resolvable PCI path.
+        group = "macOS storage" if platform_name == "darwin" else "Other storage"
+        parent = _tree_child(root, f"root:{group}", group)
+        model = ci.get("model") or ci.get("model_name") or "identity unavailable"
+        proto_label = "ATA/SATA" if protocol == "ATA" else ("NVMe" if protocol == "NVME" else (protocol or "storage"))
+        parent = _tree_child(parent, f"device:{topo.get('controller_device') or topo.get('controller')}", f"{proto_label} — {model}")
+        for ns in namespaces:
+            leaf = _topology_leaf_label(topo, ns, include_model=False)
+            _tree_child(parent, f"leaf:{ns.get('device') or ns.get('name') or leaf}", leaf)
+
+    lines.append("Storage")
+    lines.extend(_render_tree_lines(root))
+
+    errors = topology.get("errors") or []
+    if errors:
+        lines.append("")
+        lines.append("COLLECTION NOTES")
+        for row in errors:
+            lines.append(f"  - {row.get('device') or '-'}: {row.get('error') or 'topology collection failed'}")
+    return "\n".join(lines) + "\n"
 
 def render_topology_json(topology: Dict[str, Any]) -> str:
     return json.dumps(topology, indent=2, sort_keys=False) + "\n"

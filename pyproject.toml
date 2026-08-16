@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvme-doctor"
-version = "1.1.12"
+version = "1.1.20"
 description = "NVMe and SATA drive diagnostics and root-cause analyzer for Linux and macOS"
 readme = "README.md"
 requires-python = ">=3.9"

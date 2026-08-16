@@ -51,7 +51,8 @@ When `/dev/sdX` is confirmed as NVMe, SMART/Health is valid, but native PCIe lin
 
 ### macOS
 
-Native NVMe, native SATA/ATA, and external physical USB storage are discovered separately from SMART access. Native NVMe uses `system_profiler` plus `smartctl` when available; SATA/ATA uses `diskutil` plus `smartctl`, and USB-SATA uses the SAT backend when available. Synthesized APFS containers are excluded.
+Native NVMe, native SATA/ATA, and external physical USB storage are discovered separately from SMART access. Native NVMe uses `system_profiler` plus `smartctl` when available; SATA/ATA uses `diskutil` plus `smartctl`. For USB-SATA, macOS first lets smartctl auto-detect the bridge and only then tries explicit SAT mode; this covers bridges that work with plain `smartctl /dev/diskN` but fail when `-d sat` is forced. Synthesized APFS containers are excluded.
+If a macOS USB-SATA bridge hides SAT SMART, NVMe Doctor keeps the drive classified as ATA/SATA when the device identity explicitly establishes that protocol (for example a SATA-only product family) instead of falling through to the USB-NVMe/SNT path. Health remains `INCOMPLETE` until ATA SMART can actually be read.
 
 With Homebrew:
 
@@ -61,6 +62,8 @@ git clone https://github.com/KernelSoft/nvme-doctor.git
 cd nvme-doctor
 sudo ./nvme-doctor check disk0
 ```
+
+For supported macOS USB enclosures, ordinary interactive `sudo check` can use a direct read-only backend when smartctl cannot reach the underlying drive. Realtek RTL9210 USB-NVMe uses the existing vendor tunnel; identified USB-SATA drives can now use standard SAT ATA PASS THROUGH(16) over a temporarily captured BOT interface. The direct SATA path reads ATA IDENTIFY, SMART data, SMART thresholds, and SMART RETURN STATUS when the bridge returns the required SAT sense descriptor. If direct SAT is unavailable or ambiguous, NVMe Doctor falls back to an `INCOMPLETE` evidence-access report rather than guessing.
 
 For a Realtek RTL9210 USB-NVMe enclosure, ordinary interactive `check` now uses the direct backend automatically when it is safe. If the disk is already unmounted, it proceeds directly. If mounted volumes are detected, NVMe Doctor asks once before temporarily unmounting/capturing the enclosure:
 
@@ -138,7 +141,7 @@ Linux exposes considerably more low-level PCIe/NVMe evidence than macOS. NVMe Do
 | Target-scoped OS logs | current-boot kernel log | only when a stable target identity can be matched |
 | USB-NVMe bridge health | via Linux SCSI/SNT pass-through when supported | RTL9210 direct USB backend; automatic when safely unmounted, interactive confirmation when mounted, explicit `--direct-usb` for non-interactive use |
 | SATA/ATA SMART | `smartctl` ATA JSON | `smartctl` ATA JSON |
-| USB-SATA bridge health | SAT pass-through via `smartctl` | SAT pass-through via `smartctl` when supported by Darwin/bridge |
+| USB-SATA bridge health | SAT pass-through via `smartctl` | smartctl auto-detection first, explicit SAT fallback; direct read-only SAT only as last resort |
 | SATA link speed/version | `smartctl` when exposed | `smartctl` when exposed |
 
 A macOS report therefore includes a `CAPABILITIES` section such as:
@@ -254,13 +257,18 @@ Power management is deliberately handled as a **hypothesis**. NVMe Doctor does n
 
 ## Hardware topology
 
-On Linux, `topology` traces the selected SSD from CPU/NUMA locality through its actual sysfs PCIe ancestry to the NVMe endpoint and block namespaces. It does not run SMART/admin commands and normally does not require root:
+On Linux, `topology` is protocol-aware. Native NVMe is traced from CPU/NUMA locality through the actual sysfs PCIe ancestry to the NVMe endpoint and namespaces. Native ATA/SATA `sdX` disks are traced through Linux libata back to the host SATA/AHCI PCI controller. USB storage shows the host USB/enclosure path and labels the drive side only when ATA/NVMe/SCSI identity is actually confirmed. Topology normally does not require root; when SMART identity is permission-limited it falls back to sysfs/udev evidence rather than guessing:
 
 ```bash
+./nvme-doctor topology                 # all physical drives in one merged tree
 ./nvme-doctor topology nvme0
 ./nvme-doctor topology /dev/nvme0n1
+./nvme-doctor topology /dev/sda
 ./nvme-doctor topology nvme0 --json
+./nvme-doctor topology --debug           # show timed collection stages
 ```
+
+On macOS, parameterless `topology` uses a fast, non-disruptive `diskutil` physical-disk inventory and does not run SMART health collection or repeated `system_profiler` scans just to draw the tree. Human console mode shows a `Collecting topology...` spinner while the inventory is being read; JSON remains quiet and machine-readable.
 
 Example:
 
@@ -288,6 +296,8 @@ PATH CHECK
 ```
 
 For each PCIe hop NVMe Doctor reports the BDF, best-effort `lspci` description, current/max generation and width, driver, power state, and NUMA data when the kernel exposes them. A hop whose negotiated generation or width is below that device/port's own maximum is called out as down-trained.
+
+For a native SATA disk the path is rendered as the host storage path, for example `NUMA → PCIe bridge/port → SATA/AHCI controller → /dev/sda`; it is never described as an NVMe endpoint merely because Linux exposes the disk as `sdX`. USB-to-SATA similarly renders `USB host → bridge → ATA/SATA drive`, while an unconfirmed USB disk remains a generic storage device rather than being guessed as NVMe.
 
 For USB-attached NVMe, `topology` distinguishes the enclosure/USB bridge from the SSD behind it. On Linux it uses smartctl pass-through for the underlying NVMe identity when permissions allow. On macOS with one RTL9210 enclosure, interactive `sudo nvme-doctor topology diskN` uses the same safe direct-access policy as `check`: it proceeds automatically when the disk is proven unmounted, otherwise asks before temporarily unmounting/capturing it. The native SSD PCIe/NUMA/AER ancestry remains hidden by the USB bridge and is reported as such rather than invented.
 

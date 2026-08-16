@@ -300,6 +300,8 @@ def _setup(lib: ctypes.CDLL) -> None:
     lib.libusb_release_interface.argtypes = [c_void_p, c_int]; lib.libusb_release_interface.restype = c_int
     lib.libusb_set_interface_alt_setting.argtypes = [c_void_p, c_int, c_int]; lib.libusb_set_interface_alt_setting.restype = c_int
     lib.libusb_bulk_transfer.argtypes = [c_void_p, c_uint8, POINTER(c_uint8), c_int, POINTER(c_int), c_uint32]; lib.libusb_bulk_transfer.restype = c_int
+    lib.libusb_control_transfer.argtypes = [c_void_p, c_uint8, c_uint8, c_uint16, c_uint16, POINTER(c_uint8), c_uint16, c_uint32]; lib.libusb_control_transfer.restype = c_int
+    lib.libusb_clear_halt.argtypes = [c_void_p, c_uint8]; lib.libusb_clear_halt.restype = c_int
 
 
 def _get_string(lib: ctypes.CDLL, handle: c_void_p, index: int) -> Optional[str]:

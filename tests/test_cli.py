@@ -255,6 +255,27 @@ def test_list_quick_health_macos_usb_is_not_disruptively_probed(monkeypatch):
     assert cli._quick_health_probe(row) == "-"
 
 
+def test_list_quick_health_macos_usb_sata_uses_proven_smartctl_auto(monkeypatch):
+    import src.cli as cli
+    from src.model import CommandResult
+
+    monkeypatch.setattr(cli, "platform_key", lambda: "darwin")
+
+    class FakeRunner:
+        def run(self, argv, timeout=8.0):
+            assert argv == ["smartctl", "-H", "-j", "/dev/disk4"]
+            return CommandResult(argv, 0, stdout='{"smart_status":{"passed":true}}')
+
+    monkeypatch.setattr(cli, "Runner", FakeRunner)
+    row = {
+        "device": "/dev/disk4",
+        "protocol": "ATA",
+        "transport": "USB -> SATA",
+        "backend": "diskutil+smartctl-auto",
+    }
+    assert cli._quick_health_probe(row) == "GOOD"
+
+
 def test_list_quick_health_uses_existing_macos_status_without_probe(monkeypatch):
     import src.cli as cli
 
@@ -319,3 +340,21 @@ def test_device_validation_checks_normalized_whole_device(monkeypatch):
     monkeypatch.setattr(cli.os.path, "exists", lambda path: seen.append(path) or True)
     assert cli._device_or_error("/dev/sda2") == "/dev/sda2"
     assert seen == ["/dev/sda"]
+
+
+def test_command_topology_without_device_renders_merged_all_drive_tree(monkeypatch, capsys):
+    import argparse
+    import src.cli as cli
+
+    merged = {
+        "platform": "linux",
+        "all_devices": True,
+        "devices": [{"controller": "sda"}, {"controller": "sdb"}],
+        "errors": [],
+        "complete": True,
+    }
+    monkeypatch.setattr(cli, "_collect_all_topologies", lambda progress=None: merged)
+    monkeypatch.setattr(cli, "render_topology_all_text", lambda value: "MERGED TREE\n")
+    args = argparse.Namespace(device=None, direct_usb=False, json=False, debug=False, no_progress=True)
+    assert cli.command_topology(args) == cli.EXIT_OK
+    assert capsys.readouterr().out == "MERGED TREE\n"

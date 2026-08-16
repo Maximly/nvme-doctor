@@ -235,6 +235,44 @@ def _smartctl_protocol(payload: Any) -> Optional[str]:
     return None
 
 
+def _usb_storage_protocol_hint(physical: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Infer an underlying USB storage protocol only from explicit identity clues.
+
+    This is intentionally conservative.  A failed SAT probe does *not* imply
+    NVMe: on macOS many USB-SATA bridges expose only a generic block device.
+    Explicit model/bridge strings are useful for keeping known SATA products
+    out of the NVMe/SNT fallback path when SMART passthrough itself is hidden.
+    """
+    text = " ".join(str(physical.get(key) or "") for key in ("model", "bus_protocol")).strip()
+    if not text:
+        return None, None
+
+    if re.search(r"\b(?:NVME|NVM\s+EXPRESS|PCI[ -]?E)\b", text, re.I):
+        return "NVMe", "device identity explicitly identifies NVMe/PCIe"
+    if re.search(r"\b(?:SATA|SERIAL\s+ATA)\b", text, re.I):
+        return "ATA", "device identity explicitly identifies SATA"
+
+    # Product families whose interface is unambiguous even when a USB bridge
+    # hides ATA IDENTIFY/SMART from macOS. Keep this list deliberately small: it
+    # is a protocol hint, never a substitute for SMART evidence.
+    sata_only_families = (
+        (r"\bSA510\b", "WD/SanDisk SA510 is a SATA product family"),
+    )
+    for pattern, reason in sata_only_families:
+        if re.search(pattern, text, re.I):
+            return "ATA", reason
+    return None, None
+
+
+def _darwin_usb_sata_passthrough_limitation() -> str:
+    return (
+        "USB-attached ATA/SATA storage was identified, but neither smartctl automatic "
+        "bridge detection nor explicit -d sat provided ATA SMART data through this macOS "
+        "USB bridge path. The drive can be "
+        "classified correctly, but media health cannot be assessed from this transport."
+    )
+
+
 def _ata_attr_raw(payload: Dict[str, Any], attr_id: int) -> Optional[int]:
     attrs = payload.get("ata_smart_attributes")
     table = attrs.get("table") if isinstance(attrs, dict) else None
@@ -576,6 +614,117 @@ def _macos_log(runner: Runner, tokens: Iterable[str], max_lines: int) -> List[st
     return selected[-max_lines:]
 
 
+
+def collect_all_topologies_macos(
+    runner: Optional[Runner] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """Collect a fast, non-disruptive merged-topology inventory on macOS.
+
+    All-drive topology deliberately does *not* call discover_controllers_macos()
+    or collect_snapshot_macos().  Those are health-oriented collectors and can
+    invoke system_profiler and smartctl scans repeatedly.  diskutil already
+    provides the physical whole-disk inventory, identity, capacity, bus and
+    internal/external status needed for the macOS topology tree.
+    """
+    runner = runner or Runner()
+    notes: List[str] = []
+    if progress:
+        progress("Reading physical whole-disk inventory with diskutil")
+    physical = _diskutil_physical_disks(runner, notes)
+
+    devices: List[Dict[str, Any]] = []
+    for item in physical:
+        controller = str(item.get("controller") or "").strip()
+        device = str(item.get("device") or (f"/dev/{controller}" if controller else "")).strip()
+        if not controller or not device:
+            continue
+
+        bus_raw = str(item.get("bus_protocol") or "").strip()
+        bus = bus_raw.lower()
+        model = item.get("model")
+        protocol: Optional[str] = None
+        transport = bus_raw or "storage"
+        protocol_source: Optional[str] = None
+
+        if "sata" in bus or re.search(r"(^|[^a-z])ata([^a-z]|$)", bus):
+            protocol = "ATA"
+            transport = "SATA"
+            protocol_source = f"diskutil bus protocol {bus_raw}" if bus_raw else "diskutil"
+        elif "nvme" in bus:
+            protocol = "NVMe"
+            transport = "NVMe"
+            protocol_source = f"diskutil bus protocol {bus_raw}"
+        elif item.get("internal") is True and item.get("solid_state") is True and (
+            "pci" in bus or "apple fabric" in bus or str(model or "").upper().startswith("APPLE SSD")
+        ):
+            # Apple internal SSDs can be reported by diskutil as Apple Fabric
+            # rather than literally "NVMe" even though they appear in
+            # SPNVMeDataType.  This avoids running slow system_profiler solely
+            # to classify an already-known physical system SSD.
+            protocol = "NVMe"
+            transport = bus_raw or "NVMe"
+            protocol_source = "internal Apple SSD / diskutil transport"
+        elif "usb" in bus:
+            hint, reason = _usb_storage_protocol_hint(item)
+            if hint == "ATA":
+                protocol = "ATA"
+                transport = "USB -> SATA"
+                protocol_source = reason
+            else:
+                transport = "USB storage"
+
+        ci: Dict[str, Any] = {
+            "state": "present",
+            "backend": "diskutil-topology",
+            "model": model,
+            "serial": item.get("serial"),
+            "firmware_rev": item.get("firmware"),
+            "protocol": protocol,
+            "transport": transport,
+            "bus_protocol": bus_raw or None,
+            "size_in_bytes": item.get("size_bytes"),
+            "solid_state": item.get("solid_state"),
+            "internal": item.get("internal"),
+            "smart_status": item.get("smart_status"),
+        }
+        if protocol_source:
+            ci["protocol_source"] = protocol_source
+
+        devices.append({
+            "platform": "darwin",
+            "requested_device": controller,
+            "controller": controller,
+            "controller_device": device,
+            "controller_info": ci,
+            "numa_node": None,
+            "local_cpulist": None,
+            "pci_domain": None,
+            "pci_endpoint": {},
+            "pci_path": [],
+            "namespaces": [{
+                "name": controller,
+                "device": device,
+                "capacity_bytes": item.get("size_bytes"),
+            }],
+            "complete": True,
+            "notes": [
+                "All-drive macOS topology uses fast diskutil physical-disk metadata; SMART health and expensive system_profiler scans are intentionally skipped."
+            ],
+        })
+
+    devices.sort(key=lambda topo: int(re.search(r"(\d+)$", str(topo.get("controller") or "0")).group(1)) if re.search(r"(\d+)$", str(topo.get("controller") or "")) else 0)
+    if progress:
+        progress(f"Collected topology metadata for {len(devices)} physical drive(s)")
+    return {
+        "platform": "darwin",
+        "all_devices": True,
+        "devices": devices,
+        "errors": [{"device": "-", "error": note} for note in notes],
+        "complete": not notes,
+        "collection_backend": "diskutil-fast-topology",
+    }
+
 def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str, Any]]:
     runner = runner or Runner()
     profiler = _system_profiler_nvme(runner)
@@ -622,7 +771,18 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
             current["smartctl_device"] = item["smartctl_device"]
         current["smartctl_scan"] = True
         probe_device = item.get("smartctl_device") or dev
-        identity = _smartctl_identity_probe_any(runner, probe_device, item.get("smartctl_type"))
+        dtype = str(item.get("smartctl_type") or "").lower()
+        if dtype == "ata" or dtype.startswith("sat"):
+            # Some Darwin USB-SATA bridges are auto-detected correctly by
+            # smartctl but fail when the scan hint is forced back with -d sat.
+            identity = _smartctl_identity_probe_any(runner, probe_device, None)
+            if identity and _smartctl_protocol(identity) == "ATA":
+                current["smartctl_type"] = None
+                current["backend"] = "smartctl-scan+auto"
+            else:
+                identity = _smartctl_identity_probe_any(runner, probe_device, item.get("smartctl_type"))
+        else:
+            identity = _smartctl_identity_probe_any(runner, probe_device, item.get("smartctl_type"))
         if identity:
             proto = _smartctl_protocol(identity)
             current["protocol"] = proto
@@ -630,7 +790,7 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
                 current["model"] = identity.get("model_name") or current.get("model")
                 current["serial"] = identity.get("serial_number") or current.get("serial")
                 current["firmware"] = identity.get("firmware_version") or current.get("firmware")
-                if str(item.get("smartctl_type") or "").lower().startswith("sat"):
+                if dtype.startswith("sat"):
                     current["transport"] = "USB -> SATA"
                 else:
                     current["transport"] = "SATA"
@@ -677,29 +837,58 @@ def discover_controllers_macos(runner: Optional[Runner] = None) -> List[Dict[str
 
         # `smartctl --scan` is not a complete physical-disk inventory on macOS.
         # A USB-SATA bridge may be absent from scan output while `diskutil` sees
-        # the disk and `smartctl -d sat` can still identify the underlying ATA
-        # device. Probe identity only (short timeout) so `list` classifies SATA
-        # HDDs/SSDs instead of hiding them behind a generic "USB disk" row.
-        sat_identity = _smartctl_identity_probe_any(runner, dev, "sat", timeout=1.5)
-        if isinstance(sat_identity, dict) and _smartctl_protocol(sat_identity) == "ATA":
-            device_info = sat_identity.get("device") if isinstance(sat_identity.get("device"), dict) else {}
+        # the disk. Prefer smartctl automatic device detection first: observed
+        # UGREEN USB-C/SATA bridges can expose full ATA SMART this way even when
+        # forcing `-d sat` fails. Explicit SAT remains a fallback.
+        ata_identity = _smartctl_identity_probe_any(runner, dev, None, timeout=1.5)
+        smartctl_type: Optional[str] = None
+        backend = "diskutil+smartctl-auto"
+        if not (isinstance(ata_identity, dict) and _smartctl_protocol(ata_identity) == "ATA"):
+            ata_identity = _smartctl_identity_probe_any(runner, dev, "sat", timeout=1.5)
+            smartctl_type = "sat"
+            backend = "diskutil+smartctl-sat"
+        if isinstance(ata_identity, dict) and _smartctl_protocol(ata_identity) == "ATA":
+            device_info = ata_identity.get("device") if isinstance(ata_identity.get("device"), dict) else {}
             by_device[dev] = {
                 "controller": candidate["controller"],
                 "device": dev,
-                "model": sat_identity.get("model_name") or candidate.get("model"),
-                "serial": sat_identity.get("serial_number") or candidate.get("serial"),
-                "firmware": sat_identity.get("firmware_version") or candidate.get("firmware"),
+                "model": ata_identity.get("model_name") or candidate.get("model"),
+                "serial": ata_identity.get("serial_number") or candidate.get("serial"),
+                "firmware": ata_identity.get("firmware_version") or candidate.get("firmware"),
                 "state": "present",
                 "transport": "USB -> SATA",
                 "protocol": "ATA",
-                "smartctl_type": device_info.get("type") or "sat",
+                "smartctl_type": smartctl_type,
                 "smartctl_device": dev,
                 "bus_protocol": candidate.get("bus_protocol") or "USB",
                 "internal": candidate.get("internal"),
                 "size_bytes": candidate.get("size_bytes"),
                 "smart_status": candidate.get("smart_status"),
-                "rotation_rate": sat_identity.get("rotation_rate"),
-                "backend": "diskutil+smartctl-sat",
+                "rotation_rate": ata_identity.get("rotation_rate"),
+                "backend": backend,
+            }
+            continue
+
+        protocol_hint, protocol_reason = _usb_storage_protocol_hint(candidate)
+        if protocol_hint == "ATA":
+            by_device[dev] = {
+                "controller": candidate["controller"],
+                "device": dev,
+                "model": candidate.get("model"),
+                "serial": candidate.get("serial"),
+                "firmware": candidate.get("firmware"),
+                "state": "limited",
+                "transport": "USB -> SATA",
+                "protocol": "ATA",
+                "bus_protocol": candidate.get("bus_protocol") or "USB",
+                "internal": candidate.get("internal"),
+                "size_bytes": candidate.get("size_bytes"),
+                "smart_status": candidate.get("smart_status"),
+                "ata_passthrough": False,
+                "passthrough_reason": "sat-smart-unavailable",
+                "protocol_inferred": True,
+                "protocol_source": protocol_reason,
+                "backend": "diskutil",
             }
             continue
 
@@ -970,27 +1159,134 @@ def collect_snapshot_macos(
                     progress("Evidence collection complete")
                 return snapshot
 
-        # For a physical USB disk, first test the standard SAT backend. This
-        # covers USB-SATA HDDs/SSDs without disturbing the enclosure. If SAT
-        # does not identify ATA and the media is an SSD, continue to the
-        # existing RTL9210/NVMe path.
+        # For a physical USB disk, first let smartctl auto-detect the bridge.
+        # This matters on Darwin: some USB-SATA bridges work perfectly with
+        # plain `smartctl /dev/diskN` while forcing `-d sat` fails.  Only fall
+        # back to an explicit SAT backend when automatic detection cannot prove
+        # ATA.  Neither path is disruptive.
         if target_physical.get("internal") is not True and (not bus or "usb" in bus):
             if progress:
-                progress("Checking USB-SATA SAT passthrough")
-            ata_identity = _smartctl_identity_probe_any(runner, device_path, "sat", timeout=1.5)
+                progress("Checking USB storage SMART passthrough")
+            ata_identity = _smartctl_identity_probe_any(runner, device_path, None, timeout=1.5)
+            ata_device_type: Optional[str] = None
+            ata_backend = "diskutil+smartctl-auto"
+            if not (isinstance(ata_identity, dict) and _smartctl_protocol(ata_identity) == "ATA"):
+                ata_identity = _smartctl_identity_probe_any(runner, device_path, "sat", timeout=1.5)
+                ata_device_type = "sat"
+                ata_backend = "diskutil+smartctl-sat"
             if isinstance(ata_identity, dict) and _smartctl_protocol(ata_identity) == "ATA":
-                payload = _smartctl_json(runner, device_path, "sat", snapshot.collection_notes)
+                payload = _smartctl_json(runner, device_path, ata_device_type, snapshot.collection_notes)
                 if isinstance(payload, dict) and _smartctl_protocol(payload) == "ATA":
                     snapshot.controller_info.update({
-                        "backend": "diskutil+smartctl-sat",
+                        "backend": ata_backend,
                         "bus_protocol": target_physical.get("bus_protocol") or "USB",
                         "size_in_bytes": target_physical.get("size_bytes"),
                         "solid_state": target_physical.get("solid_state"),
+                        "ata_passthrough": True,
+                        "passthrough_reason": None,
                     })
                     _apply_ata_payload(snapshot, payload, usb=True)
                     if progress:
                         progress("Evidence collection complete")
                     return snapshot
+
+            protocol_hint, protocol_reason = _usb_storage_protocol_hint(target_physical)
+            if protocol_hint == "ATA":
+                # Darwin smartctl often cannot issue SAT to a USB-SATA bridge even
+                # though the bridge itself supports standard ATA PASS THROUGH.
+                # For an interactive sudo check (or explicit --direct-usb), use a
+                # generic USB mass-storage capture and try standard read-only SAT
+                # directly over a BOT alternate setting. No RTL9210/NVMe vendor
+                # command is involved in this USB-SATA path.
+                direct_sat_allowed = bool(direct_usb or (auto_direct_usb and os.geteuid() == 0))
+                if direct_sat_allowed:
+                    if progress:
+                        progress("Trying direct read-only USB-SATA SAT access")
+                    try:
+                        from .macos_usb_sata import read_usb_sata_smart
+                        direct_ata = read_usb_sata_smart(
+                            device_path,
+                            mount_state_checked=direct_usb_mount_state_checked,
+                            mounts_before=direct_usb_mounts_before,
+                            progress=progress,
+                        )
+                        payload = direct_ata.get("smartctl") if isinstance(direct_ata, dict) else None
+                        bridge = direct_ata.get("bridge") if isinstance(direct_ata, dict) else None
+                        if isinstance(payload, dict) and _smartctl_protocol(payload) == "ATA":
+                            snapshot.controller_info.update({
+                                "backend": "macos-direct-usb-sat",
+                                "bus_protocol": target_physical.get("bus_protocol") or "USB",
+                                "size_in_bytes": target_physical.get("size_bytes"),
+                                "solid_state": target_physical.get("solid_state"),
+                                "ata_passthrough": True,
+                                "direct_usb": True,
+                                "protocol_inferred": False,
+                                "protocol_source": "ATA IDENTIFY through direct SAT",
+                            })
+                            if isinstance(bridge, dict):
+                                vid = to_int(bridge.get("vendor_id"))
+                                pid = to_int(bridge.get("product_id"))
+                                snapshot.tools["macos_direct_usb_sata"] = {"bridge": bridge}
+                                vid_pid = f"{vid:04x}:{pid:04x}" if vid is not None and pid is not None else None
+                                bridge_name = " ".join(
+                                    str(x) for x in (bridge.get("manufacturer"), bridge.get("product")) if x
+                                ).strip() or None
+                                snapshot.controller_info.update({
+                                    "usb_bridge": bridge_name,
+                                    "usb_bridge_manufacturer": bridge.get("manufacturer"),
+                                    "usb_bridge_product": bridge.get("product"),
+                                    "usb_vid_pid": vid_pid,
+                                    "usb_access_mode": bridge.get("access_mode"),
+                                    "usb_path": {
+                                        "vid_pid": vid_pid,
+                                        "manufacturer": bridge.get("manufacturer"),
+                                        "product": bridge.get("product"),
+                                        "interface_driver": "direct BOT/SAT",
+                                    },
+                                })
+                            _apply_ata_payload(snapshot, payload, usb=True)
+                            snapshot.collection_notes.append(
+                                "Direct macOS USB-SATA mode temporarily acquired the enclosure, "
+                                f"read ATA IDENTIFY + SMART using read-only SAT ATA PASS THROUGH({direct_ata.get('sat_passthrough_len') or '?'}), "
+                                "then restored the original disk mount state."
+                            )
+                            if direct_ata.get("thresholds_available") is False:
+                                snapshot.collection_notes.append(
+                                    "Direct SAT SMART thresholds were unavailable; attribute values/raw counters were retained."
+                                )
+                            if progress:
+                                progress("Evidence collection complete")
+                            return snapshot
+                    except Exception as exc:
+                        snapshot.collection_notes.append(f"direct macOS USB-SATA SAT access failed: {exc}")
+                        if progress:
+                            progress(f"Direct USB-SATA SAT access failed: {exc}")
+
+                snapshot.controller_info.update({
+                    "backend": "diskutil",
+                    "state": "limited",
+                    "model": target_physical.get("model"),
+                    "serial": target_physical.get("serial"),
+                    "firmware_rev": target_physical.get("firmware"),
+                    "protocol": "ATA",
+                    "native_nvme": False,
+                    "transport": "USB -> SATA",
+                    "bus_protocol": target_physical.get("bus_protocol") or "USB",
+                    "size_in_bytes": target_physical.get("size_bytes"),
+                    "solid_state": target_physical.get("solid_state"),
+                    "smart_status": target_physical.get("smart_status"),
+                    "ata_passthrough": False,
+                    "passthrough_reason": "sat-smart-unavailable",
+                    "protocol_inferred": True,
+                    "protocol_source": protocol_reason,
+                    "direct_usb_attempted": direct_sat_allowed,
+                })
+                snapshot.collection_notes.append(_darwin_usb_sata_passthrough_limitation())
+                if protocol_reason:
+                    snapshot.collection_notes.append(f"ATA/SATA classification source: {protocol_reason}.")
+                if progress:
+                    progress("Evidence collection complete")
+                return snapshot
 
             if target_physical.get("solid_state") is True:
                 _populate_external_usb_snapshot(
@@ -1020,7 +1316,7 @@ def collect_snapshot_macos(
                     "size_in_bytes": target_physical.get("size_bytes"),
                     "solid_state": target_physical.get("solid_state"),
                 })
-                snapshot.collection_notes.append("USB disk is visible, but ATA/SATA SMART passthrough was not available through smartctl -d sat")
+                snapshot.collection_notes.append("USB disk is visible, but ATA/SATA SMART passthrough was not available through smartctl automatic detection or explicit -d sat")
                 if progress:
                     progress("Evidence collection complete")
                 return snapshot

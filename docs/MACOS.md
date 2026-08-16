@@ -79,3 +79,16 @@ Even with direct USB SMART access, macOS does not expose the same native SSD PCI
 - Linux-style ASPM/APST policy inspection.
 
 Those fields remain unavailable rather than being reported as clean.
+
+
+## Direct USB-SATA SAT backend
+
+When an external SSD is positively identified as ATA/SATA but Darwin smartctl cannot obtain SMART through `-d sat`, an interactive `sudo nvme-doctor check diskN` may use a direct read-only fallback. NVMe Doctor performs a clean whole-disk eject, captures a BOT-capable mass-storage interface through libusb, and issues standard SAT ATA PASS THROUGH(16) commands for ATA IDENTIFY, SMART READ DATA, SMART READ THRESHOLDS, and SMART RETURN STATUS. The USB interface is released and the original mount state is restored afterwards.
+
+The direct SAT path is intentionally conservative:
+
+- it runs only with root permission and only for interactive checks unless `--direct-usb` is explicit;
+- it refuses ambiguous mappings when multiple external USB SSDs or multiple BOT-capable USB mass-storage devices are present;
+- it never writes drive settings or media;
+- vendor-specific SMART attribute IDs are not assigned cross-vendor meanings merely from their numeric ID;
+- if the bridge rejects SAT or the mapping is ambiguous, the result remains `INCOMPLETE` with the access failure recorded.

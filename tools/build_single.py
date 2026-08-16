@@ -14,6 +14,7 @@ MODULE_ORDER = [
     "util",
     "platforms",
     "macos_usb_nvme",
+    "macos_usb_sata",
     "collect_macos",
     "collect",
     "diagnose",

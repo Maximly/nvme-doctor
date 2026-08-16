@@ -183,7 +183,14 @@ def _build_ata_assessment(snapshot: Snapshot, findings: List[Finding], status: s
         detail = "; ".join(f.title for f in findings if f.code in media_codes and f.severity in {"critical", "warning"})
         rows.append({"label": "Media / integrity", "state": "PROBLEM", "detail": detail})
     elif smart:
-        rows.append({"label": "Media / integrity", "state": "CLEAN", "detail": f"SMART overall-health {'passed' if smart.get('smart_passed') is not False else 'failed'}; pending={_smart_int(smart, 'current_pending_sectors') or 0}, offline-uncorrectable={_smart_int(smart, 'offline_uncorrectable') or 0}"})
+        overall = smart.get("smart_passed")
+        if overall is True:
+            prefix = "SMART overall-health passed"
+        elif overall is False:
+            prefix = "SMART overall-health failed"
+        else:
+            prefix = "SMART attributes collected; no threshold failure detected"
+        rows.append({"label": "Media / integrity", "state": "CLEAN", "detail": f"{prefix}; pending={_smart_int(smart, 'current_pending_sectors') or 0}, offline-uncorrectable={_smart_int(smart, 'offline_uncorrectable') or 0}"})
     else:
         rows.append({"label": "Media / integrity", "state": "UNKNOWN", "detail": "ATA SMART data was not collected"})
 
@@ -212,6 +219,12 @@ def _build_ata_assessment(snapshot: Snapshot, findings: List[Finding], status: s
         else:
             bits = [str(x) for x in (usb.get("usb_port"), f"{usb.get('speed_mbps')} Mb/s" if usb.get("speed_mbps") is not None else None, usb.get("interface_driver")) if x]
             rows.append({"label": "USB transport", "state": "CLEAN", "detail": "; ".join(bits) or "USB bridge path identified"})
+    elif str(snapshot.controller_info.get("transport") or "").lower().startswith("usb"):
+        rows.append({
+            "label": "USB / SATA transport",
+            "state": "UNKNOWN" if not snapshot.capabilities.get("ata_smart") else "KNOWN",
+            "detail": "USB-SATA path identified; native SATA link details and SMART are hidden by this macOS bridge path" if not snapshot.capabilities.get("ata_smart") else "USB-SATA SMART passthrough is available",
+        })
     else:
         iface = snapshot.controller_info.get("interface_speed")
         sata = snapshot.controller_info.get("sata_version")
@@ -242,7 +255,9 @@ def _build_ata_assessment(snapshot: Snapshot, findings: List[Finding], status: s
     if status == "OK":
         recommendation = "No immediate action is indicated. Save a JSON report as a baseline and compare counters if symptoms appear."
     elif status == "INCOMPLETE":
-        if isinstance(usb_path, dict) and usb_path.get("usb_port"):
+        if snapshot.controller_info.get("ata_passthrough") is False:
+            recommendation = "The SSD is identified as ATA/SATA, but this macOS USB path does not expose ATA SMART. Use a SAT-capable USB bridge/path, native SATA, or inspect it on Linux before making a health judgement."
+        elif isinstance(usb_path, dict) and usb_path.get("usb_port"):
             recommendation = "Restore ATA SMART access through the correct SAT/USB bridge backend before trusting a clean result."
         else:
             recommendation = "Restore ATA SMART access through the native libata/ATA backend before trusting a clean result."
@@ -476,12 +491,30 @@ def _diagnose_ata(snapshot: Snapshot) -> Report:
     smart = snapshot.smart or {}
     kernel = _kernel_flags(snapshot.kernel_lines) if snapshot.capabilities.get("targeted_kernel_log", True) else _kernel_flags([])
     state = str(snapshot.controller_info.get("state", "")).strip().lower()
+    ata_passthrough_unavailable = snapshot.controller_info.get("ata_passthrough") is False
 
-    if state and state not in {"live", "new", "connecting", "present"}:
+    if state and state not in {"live", "new", "connecting", "present"} and not (state == "limited" and ata_passthrough_unavailable):
         severity = "critical" if state in {"missing", "dead", "deleting"} else "warning"
         findings.append(Finding(
             "device-state", severity, "Storage device is not fully live", f"Device state is {state!r}.",
             "high", [f"device state={state}"], ["Inspect host/storage logs and physical connectivity before attempting destructive operations."],
+        ))
+
+    if ata_passthrough_unavailable:
+        findings.append(Finding(
+            "ata-passthrough-unavailable", "info",
+            "ATA SMART is unavailable through this macOS USB-SATA path",
+            "The drive is identified as ATA/SATA, but this USB bridge/path did not expose ATA SMART through either smartctl automatic bridge detection or explicit -d sat on macOS. This is an evidence-access limitation, not a drive-health failure.",
+            "high",
+            [
+                f"transport={snapshot.controller_info.get('transport') or 'USB -> SATA'}",
+                f"model={snapshot.controller_info.get('model') or 'unknown'}",
+                f"classification={snapshot.controller_info.get('protocol_source') or 'ATA identity'}",
+            ],
+            [
+                "For full ATA SMART data, inspect the SSD through a SAT-capable bridge/path or connect it to native SATA; Linux often provides broader bridge passthrough support.",
+                "Do not interpret unavailable SMART over this USB path as evidence that the SSD itself is unhealthy.",
+            ],
         ))
 
     usb = snapshot.controller_info.get("usb_path") if isinstance(snapshot.controller_info.get("usb_path"), dict) else {}
