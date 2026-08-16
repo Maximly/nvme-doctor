@@ -1,35 +1,30 @@
 # Architecture
 
-NVMe Doctor is split into platform-specific collection and a shared diagnosis layer.
+NVMe Doctor separates **collection**, **diagnosis**, and **rendering** so platform gaps cannot silently become clean-health claims.
 
 ```text
-CLI
+CLI (cli.py)
  |
- +-- collect.py ---------------- platform dispatch
- |      |
- |      +-- Linux backend
- |      |     +-- sysfs
- |      |     +-- nvme-cli
- |      |     +-- smartctl
- |      |     +-- lspci
- |      |     +-- journalctl/dmesg
- |      |
- |      +-- collect_macos.py
- |            +-- system_profiler SPNVMeDataType -json
- |            +-- diskutil physical-disk inventory
- |            +-- smartctl --scan[-open] / smartctl -a -j
- |            +-- macos_usb_nvme.py (RTL9210 direct USB path)
- |            +-- macos_usb_sata.py (generic read-only SAT/BOT USB-SATA path)
- |            +-- target-scoped unified-log evidence where possible
+ +-- collect.py ---------------- Linux collection + platform dispatch
+ |      +-- sysfs / udev
+ |      +-- nvme-cli
+ |      +-- smartctl
+ |      +-- lspci
+ |      +-- journalctl / dmesg
  |
- +-- diagnose.py -------------- shared evidence/correlation rules
+ +-- collect_macos.py ---------- macOS collection
+ |      +-- diskutil physical-disk inventory
+ |      +-- system_profiler native-NVMe detail where needed
+ |      +-- smartctl auto / scan / SAT paths
+ |      +-- macos_usb_nvme.py -- RTL9210 direct read-only NVMe path
+ |      +-- macos_usb_sata.py -- generic direct read-only SAT/BOT path
  |
- +-- render.py ---------------- text / JSON + capability disclosure
+ +-- diagnose.py --------------- evidence/correlation rules
+ +-- render.py ----------------- human/JSON reports and topology
+ +-- diff.py ------------------- before/after report comparison
 ```
 
 ## Source and distribution layout
-
-The maintainable implementation remains flat under `src/`:
 
 ```text
 src/
@@ -40,6 +35,7 @@ src/
 ├── diagnose.py
 ├── diff.py
 ├── macos_usb_nvme.py
+├── macos_usb_sata.py
 ├── model.py
 ├── platforms.py
 ├── render.py
@@ -47,59 +43,123 @@ src/
 └── util.py
 ```
 
-`tools/build_single.py` packages these modules into the root-level standalone `nvme-doctor` executable using a small in-memory importer. Relative imports and dynamic platform-specific imports continue to use the public `nvme_doctor` package name inside the bundled file.
+`tools/build_single.py` bundles these modules into the root-level standalone `nvme-doctor` executable. The bundled file exposes the same public `nvme_doctor` package name internally so relative and dynamic imports continue to work.
 
-`build.sh` invokes `tools/build_single.py` to rebuild the root-level standalone file. `install.sh` is intentionally build-free: it validates and copies the already-built root-level `nvme-doctor` into the selected prefix. The installed command therefore does not depend on a companion Python package directory.
+`build.sh` rebuilds the standalone. `install.sh` deliberately does not build; it validates and copies the existing root executable into the selected prefix.
 
-## Platform contract
+## Snapshot and capability contract
 
-A `Snapshot` contains observations plus a `capabilities` map. Rules must not infer that an unavailable platform facility is clean merely because it produced no data.
+A collected `Snapshot` contains observations plus a `capabilities` map. Diagnosis rules must distinguish:
 
-For example, macOS currently marks PCIe AER and detailed PCIe topology unavailable. Empty AER data on macOS therefore means “not collected”, not “zero errors”.
+- measured zero/clean evidence;
+- unavailable evidence;
+- unsupported evidence;
+- collection failure.
+
+For example, macOS not exposing Linux-style PCIe AER is not equivalent to measured AER counters of zero.
 
 ## Linux collection
 
-Primary sources:
+### Native NVMe
 
-- `/sys/class/nvme` for native controller identity/state;
-- `/sys/bus/pci/devices` for native-NVMe BDF, PCIe link state, NUMA locality and AER counters;
-- `nvme-cli` for native NVMe SMART, Identify Controller and error-log data;
-- `smartctl --scan[-open]` plus USB solid-state sysfs candidates to discover NVMe devices translated to `/dev/sdX`;
-- `smartctl -a -j /dev/sdX` as the primary health source for confirmed USB/SCSI-translated NVMe and as supplemental/fallback evidence for native NVMe;
-- current-boot kernel logs restricted to the target controller/block-device name and, for native NVMe, its PCIe ancestry.
+Primary evidence sources:
 
-For a translated `/dev/sdX` device, the backend deliberately marks native PCIe link/AER/NUMA facilities unavailable: the bridge can pass NVMe admin/SMART commands while still hiding the SSD's PCIe endpoint from Linux.
+- `/sys/class/nvme` and `/sys/class/block` for controller/namespace identity;
+- `/sys/bus/pci/devices` for endpoint BDF, current/max link, NUMA and AER;
+- `nvme-cli` for SMART, Identify Controller and Error Information;
+- `smartctl` as supplemental/fallback health evidence;
+- target-scoped current-boot kernel events.
+
+### ATA/SATA
+
+Physical `sdX` inventory starts from the OS/sysfs rather than relying only on `smartctl --scan`. Native libata ancestry (`.../ataN/hostN/...`) is treated as authoritative SATA evidence.
+
+Identity/health collection uses smartctl with conservative backend selection and retains OS identity even when SMART access is incomplete. Explicit ATA reserve-space attributes and raw media/transport counters are normalized into shared fields without assigning universal meaning to unrelated vendor-specific IDs.
+
+### USB storage
+
+USB/SCSI-translated devices are kept separate from the underlying media protocol. The collector records the USB/SCSI path where possible, including UAS versus `usb-storage`, physical USB path, SCSI address, and target-correlated reset/I/O evidence.
+
+A USB bridge may expose NVMe or ATA health while still hiding the drive's native PCIe/SATA host ancestry. Hidden evidence is marked unavailable rather than inferred.
 
 ## macOS collection
 
-Primary sources:
+### Native/internal drives
 
-- built-in `system_profiler SPNVMeDataType -json` for native NVMe inventory, identity and any exposed link metadata;
-- `smartctl --scan-open` with `--scan` fallback for device discovery and bridge-type hints;
-- Darwin `smartctl -a -j` for standards-defined NVMe SMART/Health and error-information data;
-- unified log only when lines can be tied to the selected device by a stable identity token.
+`diskutil` provides whole-disk identity/transport data. Native NVMe detail paths can additionally use `system_profiler SPNVMeDataType` and smartctl where available.
 
-macOS `SMART Status: Verified` is stored as contextual evidence but does not satisfy the requirement for full NVMe SMART/Health data.
+### External USB-to-SATA
 
-If smartctl itself reports a usable NVMe path/type on macOS, that exact reported path is retained. Current Darwin builds do not implement the SCSI backend required to force `sntrealtek`/`sntjmicron`/`sntasmedia` against ordinary `/dev/diskN` devices, so NVMe Doctor does not invent or force those modes.
+Probe order is intentionally non-disruptive first:
+
+1. plain smartctl automatic detection;
+2. explicit SAT smartctl mode;
+3. direct read-only libusb SAT fallback only when interaction/flags permit it.
+
+This order matters because some bridges work with smartctl automatic detection but fail if `-d sat` is forced.
+
+### External RTL9210 USB-to-NVMe
+
+When normal Darwin smartctl cannot access the underlying NVMe admin path, the RTL9210 backend may temporarily acquire the enclosure through libusb and issue only read-only NVMe Identify/SMART commands.
+
+### Fast all-drive topology
+
+Parameterless macOS `topology` has a dedicated fast path. It uses `diskutil` physical whole-disk inventory and does not run SMART health collection or repeated `system_profiler` scans merely to draw the tree.
+
+## Topology model
+
+Topology is protocol-aware rather than `sdX`-or-NVMe-name driven.
+
+### Native NVMe
+
+Linux renders:
+
+```text
+NUMA -> PCI bridge(s) -> NVMe endpoint -> namespace(s)
+```
+
+The endpoint's negotiated PCIe generation/width can be compared with its known maximum.
+
+### Native SATA
+
+Linux renders:
+
+```text
+NUMA -> PCI bridge(s) -> SATA/AHCI controller
+     -> libata port / SCSI attachment -> SATA link -> /dev/sdX
+```
+
+The AHCI controller's host-side PCIe generation is **not** the SATA drive generation. Drive-side SATA speed is reported separately.
+
+Multiple SATA drives can share one AHCI PCI function; their `ataN`/host/SCSI attachment differentiates them below that controller.
+
+### All-drive tree
+
+Parameterless `topology` collects all physical drives and merges identical hardware prefixes, so a shared PCIe bridge or AHCI controller appears once rather than once per disk.
 
 ## Diagnosis layer
 
-Rules emit a `Finding` containing:
+A `Finding` contains:
 
 - stable code;
 - severity (`critical`, `warning`, `info`);
 - human-readable diagnosis;
 - confidence;
-- exact supporting evidence;
+- supporting evidence;
 - conservative next actions.
 
-The rule engine distinguishes direct evidence from correlation. Platform-specific rules must check capability availability before treating absence of evidence as evidence of absence.
+Current-health verdict and future-looking interpretation are deliberately separate:
+
+- `HEALTHY`, `DEGRADED`, `AT RISK`, `CRITICAL`, `INCOMPLETE`;
+- near-term risk `LOW`, `ELEVATED`, `HIGH`, or `UNKNOWN`;
+- trend is `UNKNOWN` for a single snapshot and requires comparison evidence.
 
 ## Safety model
 
-NVMe commands used for health collection are read-only. Remediation text may suggest a reversible A/B test, but the program does not perform controller resets, power-policy changes, firmware updates, namespace operations or destructive commands. On macOS RTL9210 direct access temporarily unmounts and captures the USB device, then restores its original mount state.
+Drive/admin commands used by diagnostic collection are read-only. NVMe Doctor does not format/sanitize media, flash firmware, change namespaces, reset controllers, or modify power-policy settings.
 
-## JSON schema
+macOS direct USB backends are a special operational case: the drive commands remain read-only, but the enclosure may be temporarily unmounted/ejected/captured and later restored. That action is gated by root/interaction or explicit `--direct-usb` permission.
 
-Reports currently contain `schema_version: 1`. The `capabilities` object was added without changing the schema number because it is additive. Stable finding codes are intended for scripts; human-readable wording may evolve.
+## JSON/report stability
+
+Reports currently use `schema_version: 1`. The schema is additive where possible. Stable finding codes are intended for scripts; explanatory wording may evolve as field evidence improves.

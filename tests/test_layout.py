@@ -19,7 +19,7 @@ def test_flat_source_layout_and_standalone_executable(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "nvme-doctor 1.1.20"
+    assert result.stdout.strip() == "nvme-doctor 1.1.21"
     standalone = (root / "nvme-doctor").read_text(encoding="utf-8")
     assert "'nvme_doctor.macos_usb_sata':" in standalone
 
@@ -49,7 +49,7 @@ def test_build_script_rebuilds_root_standalone(tmp_path):
             check=False,
         )
         assert result.returncode == 0, result.stderr
-        assert "nvme-doctor 1.1.20" in result.stdout
+        assert "nvme-doctor 1.1.21" in result.stdout
         assert (root / "nvme-doctor").is_file()
     finally:
         # A successful build is deterministic, but preserve the checked-in artifact
@@ -98,3 +98,34 @@ def test_install_script_refuses_missing_prebuilt(tmp_path):
         assert "Run ./build.sh first" in result.stderr
     finally:
         hidden.rename(artifact)
+
+
+def test_user_documentation_tracks_current_release_and_output_semantics():
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    arch = (root / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    rules = (root / "docs" / "DIAGNOSTIC-RULES.md").read_text(encoding="utf-8")
+    macos = (root / "docs" / "MACOS.md").read_text(encoding="utf-8")
+
+    assert "**1.1.21**" in readme
+    assert "probe-needed" not in readme
+    assert "Health  Proto  Transport" in readme
+    assert "GOOD" in readme
+    assert "Size" in readme
+    assert "sudo nvme-doctor topology" in readme
+    assert "all physical drives in one merged tree" in readme
+    assert "host-controller PCIe interconnect" in readme
+    assert "smartctl automatic device detection" in readme
+
+    assert "macos_usb_sata.py" in arch
+    assert "libata port / SCSI attachment" in arch
+    assert "HEALTHY" in arch and "AT RISK" in arch and "INCOMPLETE" in arch
+
+    assert "ata-reserve-low" in rules
+    assert "Reallocated_Sector_Ct" in rules
+    assert "Gen5 SATA SSD" in rules
+
+    assert "smartctl automatic detection" in macos
+    assert "PASS THROUGH(16)" in macos
+    assert "PASS THROUGH(12)" in macos
+    assert "Collecting topology..." in macos

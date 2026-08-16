@@ -1,94 +1,104 @@
 # macOS backend notes
 
-## Data sources
+macOS exposes less native storage-path detail than Linux, so NVMe Doctor separates **physical-disk inventory**, **health access**, and **optional direct USB access**.
 
-NVMe Doctor uses different paths for native NVMe and USB-NVMe bridges.
+## Physical disk inventory
 
-### Native NVMe
+`diskutil` is the primary source for real whole disks and excludes synthesized APFS containers/volumes from physical-drive discovery.
 
-- `system_profiler SPNVMeDataType -json` provides native NVMe inventory.
-- `smartctl -a -j /dev/diskN` provides standards-defined NVMe health where Darwin smartmontools can reach Apple's native NVMe SMART user client.
-- `smartctl --scan-open` and `--scan` are merged for device hints.
+For parameterless:
 
-### External physical disks
+```sh
+sudo nvme-doctor topology
+```
 
-`diskutil` inventories real whole disks and excludes synthesized APFS devices. An external USB SSD remains visible even when SMART/admin access is unavailable.
+NVMe Doctor uses a dedicated fast `diskutil` inventory path. It does not run SMART health collection or repeated `system_profiler` scans solely to draw the all-drive tree. Human mode displays a `Collecting topology...` spinner; `--debug` shows timed stages.
 
-## RTL9210 direct USB backend
+## Native NVMe
 
-NVMe Doctor includes a direct backend for Realtek RTL9210 (`0bda:9210`). It is used because current smartmontools Darwin builds do not implement the SCSI device layer required by `sntrealtek` on `/dev/diskN`.
+Detailed native-NVMe collection may use:
 
-For an interactive `sudo nvme-doctor check diskN`, direct RTL9210 health access is automatic when the target is proven unmounted. If mounted volumes are detected, NVMe Doctor asks before temporary unmount/capture. Non-interactive or machine-readable use requires explicit permission:
+- `system_profiler SPNVMeDataType -json` for controller identity and exposed link metadata;
+- `smartctl -a -j /dev/diskN` for standards-defined health where Darwin smartmontools can reach it;
+- target-scoped unified-log evidence only when the selected disk can be matched reliably.
+
+macOS `SMART Status: Verified` is contextual evidence and is not treated as a substitute for full NVMe SMART/Health data.
+
+## USB-to-SATA
+
+### Normal smartctl probe order
+
+For an identified ATA/SATA external disk, NVMe Doctor tries:
+
+1. smartctl automatic detection on `/dev/diskN`;
+2. explicit `-d sat` only if automatic detection does not provide ATA SMART;
+3. direct read-only USB SAT as a last resort when permitted.
+
+Automatic detection comes first because real bridges exist that successfully expose full ATA SMART through plain smartctl but fail when `-d sat` is forced.
+
+### Direct USB-SATA fallback
+
+When normal smartctl access is unavailable and the drive is positively identified as ATA/SATA, an interactive root check (or explicit `--direct-usb`) may temporarily acquire the USB mass-storage interface through libusb.
+
+The direct path:
+
+1. records the target disk/mount state and performs a clean whole-disk eject;
+2. identifies a suitable BOT-capable USB mass-storage interface conservatively;
+3. switches an UAS-capable enclosure to its BOT fallback when available;
+4. performs standard USB Mass Storage BOT reset/clear-halt recovery;
+5. verifies the transport with standard SCSI INQUIRY;
+6. tries read-only SAT ATA PASS THROUGH(16), then PASS THROUGH(12) if required;
+7. reads ATA IDENTIFY, SMART data, SMART thresholds, and SMART RETURN STATUS where supported;
+8. releases the interface and restores/re-probes the original disk/mount state.
+
+A failed BOT/SAT command is recovered before trying the alternate SAT CDB size so a stale CSW/halted endpoint does not poison the fallback attempt.
+
+The implementation does not assign vendor-specific SMART meanings merely from attribute numbers. Unknown vendor attributes stay raw unless their meaning is established by reliable identity/metadata.
+
+If mapping or SAT behavior is ambiguous, the result remains `INCOMPLETE` rather than guessing.
+
+## RTL9210 USB-to-NVMe direct backend
+
+NVMe Doctor includes a narrow direct backend for Realtek RTL9210 (`0bda:9210`) because Darwin smartmontools may not expose the SCSI/SNT path needed to reach the underlying NVMe admin interface.
+
+For an interactive root check, direct health access may proceed automatically when the target is proven unmounted. If mounted volumes are present, NVMe Doctor asks before temporary unmount/eject/capture. Non-interactive direct access requires explicit permission:
 
 ```sh
 sudo nvme-doctor check disk4 --direct-usb
 ```
 
-The direct path:
+The direct RTL9210 path:
 
-1. verifies the target is the only external physical USB SSD;
-2. verifies exactly one openable RTL9210 bridge is connected;
-3. cleanly unmounts the whole disk;
-4. captures/detaches the macOS USB storage driver with libusb;
-5. claims interface 0 and selects the bridge's BOT alternate setting;
-6. sends RTL9210 vendor SCSI CDB `0xE4` carrying read-only NVMe commands;
-7. reads NVMe Identify Controller (`0x06`, CNS 1);
-8. reads the 512-byte NVMe SMART/Health log (`Get Log Page 0x02`, LID 0x02);
-9. releases the interface, reattaches the macOS storage driver, and restores the disk's original mount state.
+1. validates the external USB target conservatively;
+2. performs a clean whole-disk eject before opening the bridge to avoid stale libusb handles;
+3. captures the bridge and uses its BOT alternate setting;
+4. sends the RTL9210 vendor tunnel carrying read-only NVMe Identify Controller and SMART/Health commands;
+5. optionally reads Error Information/Firmware Slot logs with `--usb-extra-logs`;
+6. releases the bridge, lets macOS re-probe the disk, and restores the original mount state.
 
-The backend does **not** send format, sanitize, firmware activation, namespace-management, write, reset, or feature-changing commands. The NVMe operations are read-only, but temporary capture/mount-state restoration is operationally disruptive, so close applications using the disk first.
+It does **not** send format, sanitize, firmware activation, namespace-management, write, reset, or feature-changing NVMe commands.
 
-Homebrew libusb is required for this optional path:
+## Direct USB safety
+
+Direct USB paths are read-only at the drive-command level but operationally disruptive because temporary unmount/eject/driver capture can occur. Close applications using the external disk first.
+
+`nvme-doctor list` and parameterless `topology` never use direct/eject/capture access merely to improve presentation.
+
+Homebrew libusb is required only for optional direct USB backends:
 
 ```sh
 brew install libusb
 ```
 
-The repository itself still has no pip dependency for normal use.
-
-## Why BOT is used
-
-The tested RTL9210 exposes both:
-
-- interface 0 alternate setting 0: USB Mass Storage Bulk-Only Transport (BOT);
-- interface 0 alternate setting 1: UAS/UASP.
-
-macOS normally owns the UAS path. After explicit capture, NVMe Doctor selects BOT because the RTL9210 vendor SCSI CDB can then be carried with the much simpler standard BOT CBW/data/CSW sequence.
-
-## Current direct-backend scope
-
-The direct implementation is intentionally narrow and conservative:
-
-- Realtek RTL9210 (`0bda:9210`) only;
-- exactly one external physical USB SSD;
-- exactly one RTL9210 bridge;
-- root required;
-- Identify + SMART are the default fast path; Error Information and Firmware Slot logs are opt-in with `--usb-extra-logs` because some RTL9210 firmware revisions reject them slowly.
-- Direct RTL9210 capture performs a whole-disk `diskutil eject` before detaching the macOS USB storage driver, preventing the system “Disk Not Ejected Properly” warning; previously mounted media is re-mounted after the driver re-probes it.
-
-This avoids guessing which bridge belongs to which `diskN` when macOS does not expose a reliable disk-to-USB VID:PID mapping through `diskutil`. Other bridge chipsets remain capability-dependent.
-
 ## Intentional macOS limitations
 
-Even with direct USB SMART access, macOS does not expose the same native SSD PCIe path information as Linux. NVMe Doctor therefore does not claim to provide, for a USB-connected SSD:
+NVMe Doctor does not invent Linux-only evidence. Depending on the device/path, macOS may not expose:
 
-- native SSD PCIe generation/link state;
+- native SSD PCIe generation/width behind a USB bridge;
 - PCIe AER counters;
-- upstream root-port/switch correlation;
+- full upstream root-port/switch ancestry;
 - NUMA locality;
-- Linux-style ASPM/APST policy inspection.
+- Linux-style ASPM/APST policy state;
+- sufficiently target-scoped historical storage logs.
 
-Those fields remain unavailable rather than being reported as clean.
-
-
-## Direct USB-SATA SAT backend
-
-When an external SSD is positively identified as ATA/SATA but Darwin smartctl cannot obtain SMART through `-d sat`, an interactive `sudo nvme-doctor check diskN` may use a direct read-only fallback. NVMe Doctor performs a clean whole-disk eject, captures a BOT-capable mass-storage interface through libusb, and issues standard SAT ATA PASS THROUGH(16) commands for ATA IDENTIFY, SMART READ DATA, SMART READ THRESHOLDS, and SMART RETURN STATUS. The USB interface is released and the original mount state is restored afterwards.
-
-The direct SAT path is intentionally conservative:
-
-- it runs only with root permission and only for interactive checks unless `--direct-usb` is explicit;
-- it refuses ambiguous mappings when multiple external USB SSDs or multiple BOT-capable USB mass-storage devices are present;
-- it never writes drive settings or media;
-- vendor-specific SMART attribute IDs are not assigned cross-vendor meanings merely from their numeric ID;
-- if the bridge rejects SAT or the mapping is ambiguous, the result remains `INCOMPLETE` with the access failure recorded.
+Unavailable fields remain unavailable rather than being reported as clean.

@@ -1,3 +1,14 @@
+# Changelog
+
+## 1.1.21 - 2026-08-16
+
+- Audited and refreshed README, architecture, diagnostic-rule, macOS, contributing, and security documentation against current CLI/source behavior.
+- Removed stale README references to 1.1.8, `probe-needed`, obsolete list layout, and pre-all-drive topology behavior.
+- Documented current `list` Health/Size columns, assessment semantics, merged all-drive topology, SATA host-vs-drive link distinction, libata port mapping, and fast macOS topology path.
+- Updated macOS USB-SATA documentation to the real probe order: smartctl automatic detection -> explicit SAT -> direct read-only SAT fallback, including SAT16/SAT12 and BOT recovery behavior.
+- Corrected historical 1.1.3-1.1.5 and 1.1.9-1.1.10 changelog entries that had drifted from the actual releases.
+- Added documentation-staleness regression checks so key user-facing docs must track the current version and output semantics.
+
 ## 1.1.20
 
 - Make parameterless `nvme-doctor topology` show an immediate `Collecting topology...` spinner on human consoles; `topology --debug` exposes elapsed collection stages instead.
@@ -73,10 +84,16 @@
 
 ## 1.1.10
 
-- Added a compact `Health` column to `nvme-doctor list`.
-- Quick list health uses non-disruptive SMART/OS status only: `OK`, `WARN`, `FAIL`, or `-`.
-- Independent per-disk health probes run concurrently with a short timeout so systems with many drives remain responsive.
-- macOS USB bridges that would require eject/direct capture are deliberately shown as `-` in `list`; use `check` for full health collection.
+- Removed the `State` column from human `nvme-doctor list` output because internal labels such as `live`/`direct-ready` were not useful as a quick inventory field.
+- Added the `Size` column using already-collected OS capacity data so listing does not require another slow probe.
+- Native NVMe controller size is derived from visible namespaces; Linux SATA/USB uses block-device size; macOS uses diskutil capacity.
+
+## 1.1.9
+
+- Added the compact `Health` column to `nvme-doctor list`.
+- Quick list health uses only non-disruptive SMART/OS evidence and reports `OK`, `WARN`, `FAIL`, or `-` in this release.
+- Per-disk quick-health probes run concurrently with a short timeout so many-drive systems do not serialize the delay.
+- macOS USB bridges that would require eject/direct capture are deliberately shown as `-`; use `check` for full health collection.
 
 ## 1.1.8
 
@@ -102,9 +119,22 @@
 
 ## 1.1.5
 
-- Normalize running Linux SATA/libata disks to `State=live` instead of the inventory-only `present` label.
-- Merge SATA list identity from smartctl, udev, and sysfs so model, serial, and firmware remain visible even when smartctl returns ambiguous SCSI-style JSON.
-- Use `/sys/class/block/<disk>/device/state` as the availability source for SATA rows.
+- Unified `check` and `list` SATA identity/state resolution so a native libata drive keeps model, serial, firmware, protocol and live state even when smartctl returns partial/non-zero status.
+- Ignore misleading `-d scsi` scan hints for native Linux libata disks and probe ATA backends in a conservative order (`-d ata`, automatic detection, then SAT where appropriate).
+- Keep valid ATA SMART JSON even when smartctl returns status bits, rather than discarding useful evidence solely because the process exit code is non-zero.
+- Native SATA no longer reports a USB transport status line, and ATA capacity is labeled `Capacity` rather than `NVM capacity`.
+- Added regression coverage for native SATA with smartctl status `0x04` plus udev/sysfs identity.
+
+## 1.1.4
+
+- Normalize Linux `/sys/class/block/sdX/device/state` value `running` to the user-facing live state.
+- Add SATA identity fallback precedence across smartctl, udev, and sysfs so list output retains model, serial and firmware when SMART probing is ambiguous.
+
+## 1.1.3
+
+- Fixed native Linux SATA disks being dropped when smartctl returned valid but SCSI-like/ambiguous JSON.
+- Treat a native `.../ataN/...` sysfs ancestry as SATA evidence.
+- Retry ambiguous native SATA identity with `smartctl -d ata` and retain OS-visible physical disks instead of silently omitting them.
 
 ## 1.1.2
 
@@ -120,8 +150,6 @@
 - Add `build.sh` as the release/developer build entry point; it rebuilds the root-level standalone `nvme-doctor`.
 - `install.sh` no longer invokes Python, `tools/build_single.py`, or any temporary build directory. It installs only the pre-built root-level `nvme-doctor` and fails with a clear message when that artifact is missing or non-executable.
 - `make build` delegates to `build.sh`; `make install` installs the existing artifact without an implicit rebuild.
-
-# Changelog
 
 ## 1.1.0
 
