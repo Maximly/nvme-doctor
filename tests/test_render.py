@@ -9,7 +9,7 @@ def test_render_shows_pcie_generation_and_lifetime_context():
     s.controller_info = {
         "state": "live",
         "model": "INTEL SSDPF2KX960HZ",
-        "serial": "PHAO405001BW960RGN",
+        "serial": "TESTSERIAL0000000001",
         "firmware_rev": "YCV10200",
         "nvme_version_raw": 0x00010400,
     }

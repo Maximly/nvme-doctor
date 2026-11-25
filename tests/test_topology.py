@@ -225,7 +225,7 @@ class NativeSataTopologyRunner:
                 stdout=(
                     "ID_BUS=ata\n"
                     "ID_MODEL=SOLIDIGM_SSDSC2KB019TZ\n"
-                    "ID_SERIAL_SHORT=BTYI549203JJ1P9DGN\n"
+                    "ID_SERIAL_SHORT=TESTSERIAL0000000003\n"
                     "ID_REVISION=7CV10130\n"
                 ),
             )
@@ -324,7 +324,7 @@ class NativeSataSmartctlTopologyRunner(NativeSataTopologyRunner):
                 stdout='''{
   "device": {"name": "/dev/sda", "type": "sat", "protocol": "ATA"},
   "model_name": "SOLIDIGM SSDSC2KB019TZ",
-  "serial_number": "BTYI549203JJ1P9DGN",
+  "serial_number": "TESTSERIAL0000000003",
   "firmware_version": "7CV10130",
   "sata_version": {"string": "SATA 3.3, 6.0 Gb/s"},
   "interface_speed": {

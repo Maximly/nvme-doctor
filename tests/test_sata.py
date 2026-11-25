@@ -343,7 +343,7 @@ def test_linux_sata_fallback_uses_live_state_and_udev_identity(tmp_path):
                 return CommandResult(argv, 0, stdout=(
                     "ID_BUS=ata\n"
                     "ID_MODEL=SOLIDIGM_SSDSC2KB019T8\n"
-                    "ID_SERIAL_SHORT=PHYG123456781P9DGN\n"
+                    "ID_SERIAL_SHORT=TESTSERIAL0000000002\n"
                     "ID_REVISION=SCV10200\n"
                 ))
             return CommandResult(argv, 127, stderr="not found", available=False)
@@ -357,7 +357,7 @@ def test_linux_sata_fallback_uses_live_state_and_udev_identity(tmp_path):
     assert row["protocol"] == "ATA"
     assert row["transport"] == "SATA"
     assert row["model"] == "SOLIDIGM SSDSC2KB019T8"
-    assert row["serial"] == "PHYG123456781P9DGN"
+    assert row["serial"] == "TESTSERIAL0000000002"
     assert row["firmware"] == "SCV10200"
 
 
@@ -403,7 +403,7 @@ def test_linux_check_native_sata_reuses_list_identity_state_and_ignores_scsi_sca
                 return CommandResult(argv, 0, stdout=(
                     "ID_BUS=ata\n"
                     "ID_MODEL=SOLIDIGM_SSDSC2KB019TZ\n"
-                    "ID_SERIAL_SHORT=BTYI549203JJ1P9DGN\n"
+                    "ID_SERIAL_SHORT=TESTSERIAL0000000003\n"
                     "ID_REVISION=7CV10130\n"
                 ))
             if argv == ["smartctl", "-d", "ata", "-a", "-j", "/dev/sda"]:
@@ -424,7 +424,7 @@ def test_linux_check_native_sata_reuses_list_identity_state_and_ignores_scsi_sca
     assert snap.controller_info["transport"] == "SATA"
     assert snap.controller_info["state"] == "live"
     assert snap.controller_info["model"] == "SOLIDIGM SSDSC2KB019TZ"
-    assert snap.controller_info["serial"] == "BTYI549203JJ1P9DGN"
+    assert snap.controller_info["serial"] == "TESTSERIAL0000000003"
     assert snap.controller_info["firmware_rev"] == "7CV10130"
     assert snap.controller_info["smartctl_device_type"] == "ata"
     assert snap.controller_info.get("usb_path") == {}
@@ -438,7 +438,7 @@ def test_linux_check_native_sata_reuses_list_identity_state_and_ignores_scsi_sca
     assert "NVM capacity" not in text
     assert "State                live" in text
     assert "SOLIDIGM SSDSC2KB019TZ" in text
-    assert "BTYI549203JJ1P9DGN" in text
+    assert "TESTSERIAL0000000003" in text
     assert "7CV10130" in text
 
 
