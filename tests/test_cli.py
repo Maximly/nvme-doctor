@@ -242,6 +242,66 @@ def test_list_quick_health_maps_smart_pass_fail_and_nvme_warning():
     assert cli._quick_health_from_payload({}) == "-"
 
 
+def test_list_quick_temperature_from_payload():
+    import src.cli as cli
+
+    assert cli._quick_temperature_from_payload({"temperature": {"current": 32}}) == 32
+    assert cli._quick_temperature_from_payload(
+        {"nvme_smart_health_information_log": {"temperature": 41}}
+    ) == 41
+    assert cli._quick_temperature_from_payload({
+        "ata_smart_attributes": {"table": [
+            {"id": 194, "name": "Temperature_Celsius", "value": 36, "raw": {"value": 36}},
+        ]},
+    }) == 36
+    assert cli._quick_temperature_from_payload({
+        "ata_smart_attributes": {"table": [
+            {"id": 190, "name": "Airflow_Temperature_Cel", "raw": {"value": 0x2200000020}},
+        ]},
+    }) == 32
+    assert cli._quick_temperature_from_payload({}) is None
+    assert cli._quick_temperature_from_payload(None) is None
+
+
+def test_list_quick_tbw_from_payload():
+    import src.cli as cli
+
+    assert cli._quick_tbw_from_payload(
+        {"nvme_smart_health_information_log": {"data_units_written": 1000}}
+    ) == 512_000_000
+    assert cli._quick_tbw_from_payload({
+        "ata_smart_attributes": {"table": [
+            {"id": 241, "name": "Total_LBAs_Written", "raw": {"value": 12345}},
+        ]},
+    }) == 12345 * 512
+    assert cli._quick_tbw_from_payload({
+        "ata_smart_attributes": {"table": [
+            {"id": 241, "name": "Host_Writes_32MiB", "raw": {"value": 1000}},
+        ]},
+    }) == 1000 * 32 * 1024 * 1024
+    assert cli._quick_tbw_from_payload({
+        "ata_device_statistics": {"pages": [
+            {"name": "General Purpose Log", "table": [
+                {"name": "Lifetime Writes", "unit": "GBytes written", "value": 850},
+            ]},
+        ]},
+    }) == 850 * 10**9
+    assert cli._quick_tbw_from_payload({
+        "ata_device_statistics": {"pages": [
+            {"name": "General Purpose Log", "table": [
+                {"name": "Lifetime Writes", "unit": "sectors written", "value": 1000},
+            ]},
+        ]},
+    }) == 1000 * 512
+    assert cli._quick_tbw_from_payload({
+        "ata_smart_attributes": {"table": [
+            {"id": 5, "name": "Reallocated_Sector_Ct", "raw": {"value": 99}},
+        ]},
+    }) is None
+    assert cli._quick_tbw_from_payload({}) is None
+    assert cli._quick_tbw_from_payload(None) is None
+
+
 def test_list_quick_health_macos_usb_is_not_disruptively_probed(monkeypatch):
     import src.cli as cli
 
@@ -252,7 +312,7 @@ def test_list_quick_health_macos_usb_is_not_disruptively_probed(monkeypatch):
         "transport": "USB -> NVMe",
         "state": "direct-ready",
     }
-    assert cli._quick_health_probe(row) == "-"
+    assert cli._quick_probe(row) == {"health": "-", "temperature": None, "tbw_bytes": None}
 
 
 def test_list_quick_health_macos_usb_sata_uses_proven_smartctl_auto(monkeypatch):
@@ -263,8 +323,12 @@ def test_list_quick_health_macos_usb_sata_uses_proven_smartctl_auto(monkeypatch)
 
     class FakeRunner:
         def run(self, argv, timeout=8.0):
-            assert argv == ["smartctl", "-H", "-j", "/dev/disk4"]
-            return CommandResult(argv, 0, stdout='{"smart_status":{"passed":true}}')
+            assert argv == ["smartctl", "-H", "-A", "-l", "devstat", "-j", "/dev/disk4"]
+            return CommandResult(
+                argv, 0,
+                stdout='{"smart_status":{"passed":true},"temperature":{"current":38},'
+                       '"nvme_smart_health_information_log":{"data_units_written":2000}}',
+            )
 
     monkeypatch.setattr(cli, "Runner", FakeRunner)
     row = {
@@ -273,23 +337,34 @@ def test_list_quick_health_macos_usb_sata_uses_proven_smartctl_auto(monkeypatch)
         "transport": "USB -> SATA",
         "backend": "diskutil+smartctl-auto",
     }
-    assert cli._quick_health_probe(row) == "GOOD"
+    assert cli._quick_probe(row) == {
+        "health": "GOOD",
+        "temperature": 38,
+        "tbw_bytes": 2000 * 512_000,
+    }
 
 
-def test_list_quick_health_uses_existing_macos_status_without_probe(monkeypatch):
+def test_list_quick_probe_falls_back_to_existing_macos_status(monkeypatch):
     import src.cli as cli
+    from src.model import CommandResult
 
     monkeypatch.setattr(cli, "platform_key", lambda: "darwin")
+
+    class FakeRunner:
+        def run(self, argv, timeout=8.0):
+            return CommandResult(argv, 0, stdout="")
+
+    monkeypatch.setattr(cli, "Runner", FakeRunner)
     row = {
         "device": "/dev/disk0",
         "protocol": "NVMe",
         "transport": "NVMe",
         "smart_status": "Verified",
     }
-    assert cli._quick_health_probe(row) == "GOOD"
+    assert cli._quick_probe(row) == {"health": "GOOD", "temperature": None, "tbw_bytes": None}
 
 
-def test_list_output_has_health_column(monkeypatch, capsys):
+def test_list_output_has_health_and_temp_columns(monkeypatch, capsys):
     import argparse
     import src.cli as cli
 
@@ -304,15 +379,162 @@ def test_list_output_has_health_column(monkeypatch, capsys):
         "serial": "SER1",
         "size_bytes": 1_920_000_000_000,
     }])
-    monkeypatch.setattr(cli, "_add_quick_health", lambda rows: [dict(rows[0], health="GOOD")])
+    monkeypatch.setattr(
+        cli, "_add_quick_probe",
+        lambda rows: [dict(rows[0], health="GOOD", temperature=34, tbw_bytes=1_234_000_000_000)],
+    )
     assert cli.command_list(argparse.Namespace(json=False)) == 0
     out = capsys.readouterr().out
-    assert "Health" in out
-    assert "Size" in out
-    assert "State" not in out.splitlines()[0]
+    lines = out.splitlines()
+    assert "Temp" in lines[0]
+    assert "Health" in lines[0]
+    assert "Size" in lines[0]
+    assert "TBW" in lines[0]
+    assert "State" not in lines[0]
     assert "1.92 TB" in out
+    assert "1.23 TB" in out
     assert "sda" in out
     assert "GOOD" in out
+    assert "34°C" in out
+
+
+def test_list_output_shows_dash_when_temperature_unknown(monkeypatch, capsys):
+    import argparse
+    import src.cli as cli
+
+    monkeypatch.setattr(cli, "discover_controllers", lambda: [{
+        "controller": "sda",
+        "device": "/dev/sda",
+        "state": "live",
+        "protocol": "ATA",
+        "transport": "SATA",
+        "model": "SOLIDIGM TEST",
+        "firmware": "FW1",
+        "serial": "SER1",
+        "size_bytes": 1_920_000_000_000,
+    }])
+    monkeypatch.setattr(
+        cli, "_add_quick_probe",
+        lambda rows: [dict(rows[0], health="GOOD", temperature=None, tbw_bytes=None)],
+    )
+    assert cli.command_list(argparse.Namespace(json=False)) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[1].split()[2] == "-"
+
+
+def test_list_sorts_controllers_naturally(monkeypatch, capsys):
+    import argparse
+    import src.cli as cli
+
+    def row(name):
+        return {
+            "controller": name,
+            "device": f"/dev/{name}",
+            "state": "live",
+            "protocol": "NVMe",
+            "transport": "pcie",
+            "model": "M",
+            "firmware": "F",
+            "serial": "S",
+            "size_bytes": 1_000_000_000_000,
+        }
+
+    monkeypatch.setattr(
+        cli, "discover_controllers",
+        lambda: [row("nvme10"), row("nvme2"), row("sda"), row("nvme9"), row("nvme1")],
+    )
+    monkeypatch.setattr(
+        cli, "_add_quick_probe",
+        lambda rows: [dict(r, health="GOOD", temperature=30, tbw_bytes=None) for r in rows],
+    )
+    assert cli.command_list(argparse.Namespace(json=False)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    order = [line.split()[0] for line in lines[1:]]
+    assert order == ["nvme1", "nvme2", "nvme9", "nvme10", "sda"]
+
+
+def test_install_command_refuses_non_standalone_runs(capsys):
+    import argparse
+    import src.cli as cli
+
+    rc = cli.command_install(argparse.Namespace(prefix=None, destdir=None))
+    assert rc == cli.EXIT_ERROR
+    assert "standalone" in capsys.readouterr().err
+
+
+def test_install_command_copies_running_executable(monkeypatch, tmp_path, capsys):
+    import argparse
+    import src.cli as cli
+
+    fake = tmp_path / "nvme-doctor"
+    fake.write_text("#!/bin/sh\necho fake\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(cli, "__file__", "<bundled:nvme_doctor.cli>")
+    monkeypatch.setattr(cli, "__version__", "9.9.9")
+    monkeypatch.setattr(cli.sys, "argv", [str(fake), "install"])
+    prefix = tmp_path / "prefix"
+    rc = cli.command_install(argparse.Namespace(prefix=str(prefix), destdir=None))
+    assert rc == cli.EXIT_OK
+    installed = prefix / "bin" / "nvme-doctor"
+    assert installed.is_file()
+    assert installed.read_bytes() == fake.read_bytes()
+    assert installed.stat().st_mode & 0o777 == 0o755
+    out = capsys.readouterr().out
+    assert "Installed nvme-doctor 9.9.9" in out
+    assert str(installed) in out
+
+
+def test_install_command_idempotent_when_already_installed(monkeypatch, tmp_path, capsys):
+    import argparse
+    import src.cli as cli
+
+    prefix = tmp_path / "prefix"
+    installed = prefix / "bin" / "nvme-doctor"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("#!/bin/sh\necho fake\n")
+    installed.chmod(0o755)
+    monkeypatch.setattr(cli, "__file__", "<bundled:nvme_doctor.cli>")
+    monkeypatch.setattr(cli, "__version__", "9.9.9")
+    monkeypatch.setattr(cli.sys, "argv", [str(installed), "install"])
+    rc = cli.command_install(argparse.Namespace(prefix=str(prefix), destdir=None))
+    assert rc == cli.EXIT_OK
+    assert "already installed" in capsys.readouterr().out
+
+
+def test_remove_command_deletes_installed_executable(tmp_path, capsys):
+    import argparse
+    import src.cli as cli
+
+    prefix = tmp_path / "prefix"
+    installed = prefix / "bin" / "nvme-doctor"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("x")
+    rc = cli.command_remove(argparse.Namespace(prefix=str(prefix), destdir=None))
+    assert rc == cli.EXIT_OK
+    assert not installed.exists()
+    assert "Removed nvme-doctor" in capsys.readouterr().out
+
+
+def test_remove_command_idempotent_when_missing(tmp_path, capsys):
+    import argparse
+    import src.cli as cli
+
+    prefix = tmp_path / "prefix"
+    rc = cli.command_remove(argparse.Namespace(prefix=str(prefix), destdir=None))
+    assert rc == cli.EXIT_OK
+    assert "Removed nvme-doctor" in capsys.readouterr().out
+
+
+def test_parser_accepts_install_and_remove():
+    import src.cli as cli
+
+    args = cli.build_parser().parse_args(["install"])
+    assert args.command == "install"
+    args = cli.build_parser().parse_args(["remove", "--prefix", "/opt"])
+    assert args.command == "remove"
+    assert args.prefix == "/opt"
+    assert cli._normalize_argv(["install"]) == ["install"]
+    assert cli._normalize_argv(["remove"]) == ["remove"]
 
 
 def test_missing_linux_device_is_hard_error_before_collection(monkeypatch, capsys):
