@@ -53,3 +53,13 @@ def test_smartctl_nvme_version_object():
     from src.util import format_nvme_version
     assert format_nvme_version({"string": "2.0", "value": 131072}) == "2.0"
     assert format_nvme_version({"value": 0x00010400}) == "1.4"
+
+
+def test_format_tbw_bytes_scales():
+    from src.util import format_tbw_bytes
+    assert format_tbw_bytes(1_500_000_000_000) == "1.50 TB"
+    assert format_tbw_bytes(512_000_000) == "512.00 MB"
+    assert format_tbw_bytes(999_999_999) == "1000.00 MB"
+    assert format_tbw_bytes(1_000_000_000) == "1.00 GB"
+    assert format_tbw_bytes(None) is None
+    assert format_tbw_bytes(-1) is None
