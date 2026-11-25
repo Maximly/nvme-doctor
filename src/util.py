@@ -290,6 +290,18 @@ def format_bytes_decimal(value: Any) -> Optional[str]:
     return f"{number} B"
 
 
+def format_tbw_bytes(value: Any) -> Optional[str]:
+    """Format a TBW-style byte count in MB/GB/TB, whichever scale fits."""
+    number = to_int(value)
+    if number is None or number < 0:
+        return None
+    units = [(10**12, "TB"), (10**9, "GB")]
+    for scale, suffix in units:
+        if number >= scale:
+            return f"{number / scale:.2f} {suffix}"
+    return f"{number / 10**6:.2f} MB"
+
+
 def nvme_data_units_to_bytes(value: Any) -> Optional[int]:
     """Convert NVMe SMART Data Units Read/Written to bytes.
 
