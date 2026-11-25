@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvme-doctor"
-version = "1.1.21"
+dynamic = ["version"]
 description = "NVMe and SATA drive diagnostics and root-cause analyzer for Linux and macOS"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -39,6 +39,9 @@ nvme-doctor = "nvme_doctor.cli:main"
 [tool.setuptools]
 packages = ["nvme_doctor"]
 package-dir = {"nvme_doctor" = "src"}
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

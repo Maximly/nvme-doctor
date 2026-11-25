@@ -8,7 +8,7 @@ NVMe Doctor is GPL-3.0-or-later software from KernelSoft.
 
 ## Current release
 
-**1.1.21**
+**1.1.24**
 
 Current scope:
 
@@ -18,7 +18,7 @@ Current scope:
 - USB-to-SATA through smartctl automatic/SAT pass-through, with a conservative direct read-only SAT fallback on macOS;
 - protocol-aware hardware topology;
 - one-tree topology for all physical drives;
-- quick non-disruptive health in `list`;
+- quick non-disruptive health, temperature and TBW in `list`;
 - doctor-style assessment, JSON reports, before/after diff, and change watching.
 
 The repository contains the maintainable source under `src/` and a pre-built standalone `./nvme-doctor` executable. The standalone uses Python's standard library and can be copied directly to another Linux or macOS machine with Python 3.9+.
@@ -51,11 +51,14 @@ nvme-doctor list --json
 Human output is intentionally compact:
 
 ```text
-Controller   Health  Proto  Transport            Size  Model                                Firmware     Serial
-nvme0        GOOD    NVMe   pcie              4.00 TB  ...                                  ...          ...
-sda          GOOD    ATA    SATA              1.92 TB  ...                                  ...          ...
-disk4        -       ATA    USB -> SATA       2.00 TB  ...                                  ...          ...
+Controller Health Temp  Proto  Transport         Size        TBW  Model                     Firmware     Serial
+nvme0      GOOD    32°C NVMe   pcie           4.00 TB    1.25 TB  ...                       ...          ...
+nvme10     GOOD    40°C NVMe   pcie           3.84 TB 1234.56 TB  ...                       ...          ...
+sda        GOOD    27°C ATA    SATA           1.92 TB  850.00 GB  ...                       ...          ...
+disk4      -          - ATA    USB -> SATA    2.00 TB          -  ...                       ...          ...
 ```
+
+Controllers are listed in natural order (`nvme2` before `nvme10`).
 
 Quick health values are:
 
@@ -64,7 +67,13 @@ Quick health values are:
 - `FAIL` — the quick health source reported failure;
 - `-` — trustworthy health is not available quickly/non-disruptively.
 
-`list` never ejects or captures a macOS USB device just to populate `Health`.
+`Temp` shows the current drive temperature in Celsius when the same quick
+non-disruptive probe can read it, and `-` otherwise.
+
+`TBW` shows total bytes written (lifetime writes) in MB/GB/TB when the quick
+probe reports it, and `-` otherwise.
+
+`list` never ejects or captures a macOS USB device just to populate `Health`, `Temp` or `TBW`.
 
 ### `check`
 
@@ -295,17 +304,23 @@ Rebuild from `src/`:
 make build
 ```
 
-Install the existing pre-built artifact:
+Install into `/usr/local/bin` (the running standalone installs itself):
 
 ```bash
-sudo ./install.sh install
-# or
-sudo make install
+sudo ./nvme-doctor install
 ```
 
-**Build and install are intentionally separate.** `install.sh` never rebuilds the program; if the root executable is missing, run `./build.sh` first.
+Remove it again:
 
-Default install location is `/usr/local/bin/nvme-doctor`; override with `PREFIX`/`DESTDIR` if required.
+```bash
+sudo ./nvme-doctor remove
+```
+
+`make install` and `make uninstall` delegate to the same commands. A pip-installed copy is managed by pip and does not support `install`/`remove`.
+
+The release version lives in the repo-root `VERSION` file. `tools/build_single.py` substitutes it into the standalone executable and updates this README's release line from it at build time; `pyproject.toml` derives the package version from the same file, and source checkouts read it at import time.
+
+Default install location is `/usr/local/bin/nvme-doctor`; override with `--prefix`/`--destdir` or the `PREFIX`/`DESTDIR` environment variables.
 
 ## Exit codes
 
