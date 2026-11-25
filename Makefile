@@ -11,11 +11,11 @@ check: build
 	PYTHONPATH=. python3 -m pytest
 	./nvme-doctor --version
 
-install:
-	./install.sh install
+install: build
+	./nvme-doctor install
 
 uninstall:
-	./install.sh remove
+	./nvme-doctor remove
 
 dist: build
 	python3 -m build

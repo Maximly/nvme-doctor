@@ -45,7 +45,9 @@ src/
 
 `tools/build_single.py` bundles these modules into the root-level standalone `nvme-doctor` executable. The bundled file exposes the same public `nvme_doctor` package name internally so relative and dynamic imports continue to work.
 
-`build.sh` rebuilds the standalone. `install.sh` deliberately does not build; it validates and copies the existing root executable into the selected prefix.
+The release version lives in the repo-root `VERSION` file. `tools/build_single.py` validates it, substitutes it for the `@@NVME_DOCTOR_VERSION@@` placeholder in the bundle, and updates the README release line from it; `pyproject.toml` derives the package version from the same file, and source checkouts read it directly at import time.
+
+`build.sh` rebuilds the standalone. Installation happens through the CLI itself: `nvme-doctor install` copies the running standalone executable into the selected prefix and `nvme-doctor remove` deletes it; the Makefile `install`/`uninstall` targets delegate to those commands. There is no separate install script.
 
 ## Snapshot and capability contract
 
