@@ -26,6 +26,14 @@ python3 -m pytest
 
 The committed/pre-built root `nvme-doctor` must match the source version and behavior.
 
+The release version lives in the repo-root `VERSION` file; change it there for a
+release and run `./build.sh` so the standalone embeds the new value and the
+README release line follows it. Do not edit version strings in `src/__init__.py`,
+`pyproject.toml` or the README directly — all derive the version from `VERSION`.
+Use `sudo ./nvme-doctor install` / `sudo ./nvme-doctor remove` to install or
+remove the built executable; the Makefile `install`/`uninstall` targets delegate
+to the same commands, and there is no separate install script.
+
 ## Diagnostic-rule policy
 
 Prefer evidence over guesses. A new rule should:
