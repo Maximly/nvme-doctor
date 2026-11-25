@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -17,7 +18,16 @@ from .collect import collect_snapshot, collect_topology, discover_controllers
 from .diagnose import diagnose
 from .diff import compare_reports, render_diff_text
 from .render import render_json, render_text, render_topology_all_text, render_topology_json, render_topology_text
-from .util import format_bytes_decimal, normalize_device, normalize_macos_device, read_json, to_int
+from .util import (
+    ata_smart_attributes,
+    format_bytes_decimal,
+    format_tbw_bytes,
+    normalize_device,
+    normalize_macos_device,
+    nvme_data_units_to_bytes,
+    read_json,
+    to_int,
+)
 from .runner import Runner
 from .platforms import platform_key, platform_label
 
@@ -101,6 +111,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="list supported NVMe and SATA/ATA devices visible to the current OS backend")
     p_list.add_argument("--json", action="store_true", help="emit JSON")
 
+    p_install = sub.add_parser("install", help="install the running standalone executable into $PREFIX/bin (default: /usr/local/bin)")
+    p_install.add_argument("--prefix", help="install prefix (default: $PREFIX or /usr/local)")
+    p_install.add_argument("--destdir", help="staging directory prepended to the prefix (default: $DESTDIR or empty)")
+
+    p_remove = sub.add_parser("remove", help="remove the installed nvme-doctor from $PREFIX/bin")
+    p_remove.add_argument("--prefix", help="install prefix (default: $PREFIX or /usr/local)")
+    p_remove.add_argument("--destdir", help="staging directory prepended to the prefix (default: $DESTDIR or empty)")
+
     p_check = sub.add_parser("check", help="collect evidence and diagnose one NVMe or SATA/ATA drive")
     _add_common(p_check)
 
@@ -137,7 +155,7 @@ def _normalize_argv(argv: List[str]) -> List[str]:
     # Friendly shorthand: `nvme-doctor /dev/nvme0` == `nvme-doctor check /dev/nvme0`.
     if not argv:
         return argv
-    known = {"list", "check", "topology", "report", "diff", "watch", "-h", "--help", "--version"}
+    known = {"list", "check", "topology", "report", "diff", "watch", "install", "remove", "-h", "--help", "--version"}
     if argv[0] not in known:
         name = Path(argv[0]).name
         if "nvme" in name or name.startswith("disk") or name.startswith("rdisk") or re.fullmatch(r"sd[a-z]+(?:\d+)?", name):
@@ -202,19 +220,99 @@ def _quick_health_from_payload(payload: Any) -> str:
     return "-"
 
 
-def _quick_health_probe(item: Dict[str, Any]) -> str:
-    """Non-disruptive, short health probe used only by `list`.
+def _quick_temperature_from_payload(payload: Any) -> Optional[int]:
+    """Extract drive temperature in Celsius from a smartctl JSON payload."""
+    if not isinstance(payload, dict):
+        return None
+    temp = payload.get("temperature")
+    if isinstance(temp, dict):
+        value = to_int(temp.get("current"))
+        if value is not None:
+            return value
+    nvme = payload.get("nvme_smart_health_information_log")
+    if isinstance(nvme, dict):
+        value = to_int(nvme.get("temperature"))
+        if value is not None:
+            return value
+    for row in ata_smart_attributes(payload):
+        if "temperature" not in str(row.get("name") or "").lower():
+            continue
+        value = to_int(row.get("value"))
+        if value is not None:
+            return value
+        raw = row.get("raw")
+        raw_value = to_int(raw.get("value")) if isinstance(raw, dict) else to_int(raw)
+        if raw_value is not None:
+            low = raw_value & 0xFF
+            if 0 < low < 150:
+                return low
+    return None
+
+
+def _quick_tbw_from_payload(payload: Any) -> Optional[int]:
+    """Extract total bytes written from a smartctl JSON payload."""
+    if not isinstance(payload, dict):
+        return None
+    nvme = payload.get("nvme_smart_health_information_log")
+    if isinstance(nvme, dict):
+        units = to_int(nvme.get("data_units_written"))
+        if units is not None:
+            return nvme_data_units_to_bytes(units)
+    # ATA Device Statistics (log 0x04) carries the authoritative lifetime
+    # writes for many SATA SSDs whose SMART attribute table lacks a written
+    # counter, or reports it under vendor-specific names.
+    stats = payload.get("ata_device_statistics")
+    if isinstance(stats, dict) and isinstance(stats.get("pages"), list):
+        for page in stats["pages"]:
+            table = page.get("table") if isinstance(page, dict) and isinstance(page.get("table"), list) else []
+            for entry in table:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("name") or "").lower() != "lifetime writes":
+                    continue
+                value = to_int(entry.get("value"))
+                unit = str(entry.get("unit") or "").lower()
+                if value is None:
+                    continue
+                if "gbyte" in unit:
+                    return value * 10**9
+                if "tbyte" in unit:
+                    return value * 10**12
+                if "mbyte" in unit:
+                    return value * 10**6
+                if "sector" in unit or "lba" in unit:
+                    return value * 512
+    # SMART attribute fallbacks: 512-byte LBA counters and the Intel/Solidigm
+    # 32 MiB host-write counter (attribute 241).
+    for row in ata_smart_attributes(payload):
+        name = str(row.get("name") or "").lower().replace("-", "_")
+        raw = row.get("raw")
+        raw_value = to_int(raw.get("value")) if isinstance(raw, dict) else to_int(raw)
+        if raw_value is None:
+            continue
+        if "host_writes_32mib" in name:
+            return raw_value * 32 * 1024 * 1024
+        if "lba" in name and "written" in name:
+            return raw_value * 512
+    return None
+
+
+def _quick_probe(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Non-disruptive, short health/temperature/TBW probe used only by `list`.
 
     Direct/capture-style USB access is deliberately never attempted here.
+    Returns ``{"health", "temperature", "tbw_bytes"}``; unknown values are
+    ``"-"``/``None``.
     """
+    empty = {"health": "-", "temperature": None, "tbw_bytes": None}
     existing = _existing_quick_health(item)
     if existing:
-        return existing
+        empty["health"] = existing
 
     transport = str(item.get("transport") or "").lower()
     protocol = str(item.get("protocol") or "").upper()
     if protocol not in {"NVME", "ATA"}:
-        return "-"
+        return empty
 
     # macOS USB health is shown only when discovery already proved that plain
     # smartctl or an explicit smartctl bridge backend can read the device
@@ -228,11 +326,11 @@ def _quick_health_probe(item: Dict[str, Any]) -> str:
         ):
             pass
         else:
-            return "-"
+            return empty
 
     device = str(item.get("device") or "").strip()
     if not device:
-        return "-"
+        return empty
 
     dtype = item.get("smartctl_device_type") or item.get("smartctl_type")
     if not dtype and protocol == "ATA" and platform_key() == "linux" and "usb" not in transport:
@@ -241,48 +339,127 @@ def _quick_health_probe(item: Dict[str, Any]) -> str:
     argv = ["smartctl"]
     if dtype:
         argv += ["-d", str(dtype)]
-    argv += ["-H", "-j", device]
+    argv += ["-H", "-A", "-l", "devstat", "-j", device]
     res = Runner().run(argv, timeout=1.5)
     if not res.available or not res.stdout.strip():
-        return "-"
-    return _quick_health_from_payload(read_json(res.stdout))
+        return empty
+    payload = read_json(res.stdout)
+    return {
+        "health": _quick_health_from_payload(payload) or empty["health"],
+        "temperature": _quick_temperature_from_payload(payload),
+        "tbw_bytes": _quick_tbw_from_payload(payload),
+    }
 
 
-def _add_quick_health(controllers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Add compact Health values without serializing per-disk probe latency."""
+def _add_quick_probe(controllers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add compact Health/temperature/TBW values without serializing per-disk probe latency."""
     if not controllers:
         return controllers
     rows = [dict(item) for item in controllers]
     workers = min(8, len(rows))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = {pool.submit(_quick_health_probe, row): idx for idx, row in enumerate(rows)}
+        pending = {pool.submit(_quick_probe, row): idx for idx, row in enumerate(rows)}
         for future in as_completed(pending):
             idx = pending[future]
             try:
-                rows[idx]["health"] = future.result() or "-"
+                result = future.result() or {}
+                rows[idx]["health"] = result.get("health") or "-"
+                rows[idx]["temperature"] = result.get("temperature")
+                rows[idx]["tbw_bytes"] = result.get("tbw_bytes")
             except Exception:
                 rows[idx]["health"] = "-"
+                rows[idx]["temperature"] = None
+                rows[idx]["tbw_bytes"] = None
     for row in rows:
         row.setdefault("health", "-")
+        row.setdefault("temperature", None)
+        row.setdefault("tbw_bytes", None)
     return rows
 
 
+def _natural_key(value: Any) -> List[Any]:
+    """Sort key that puts numeric segments in numeric order (nvme2 before nvme10)."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value or ""))]
+
+
 def command_list(args: argparse.Namespace) -> int:
-    controllers = _add_quick_health(discover_controllers())
+    controllers = sorted(
+        _add_quick_probe(discover_controllers()),
+        key=lambda item: _natural_key(item.get("controller") or item.get("device")),
+    )
     if args.json:
         sys.stdout.write(json.dumps(controllers, indent=2) + "\n")
         return EXIT_OK
     if not controllers:
         print(f"No supported NVMe/SATA devices found by the {platform_label()} backend.")
         return EXIT_WARNING
-    print(f"{'Controller':<12} {'Health':<7} {'Proto':<6} {'Transport':<14} {'Size':>10}  {'Model':<36} {'Firmware':<12} Serial")
+    print(f"{'Controller':<10} {'Health':<6} {'Temp':<5} {'Proto':<6} {'Transport':<12} {'Size':>9} {'TBW':>10}  {'Model':<25} {'Firmware':<12} Serial")
     for item in controllers:
         size = format_bytes_decimal(item.get('size_bytes')) or '-'
+        tbw = format_tbw_bytes(item.get('tbw_bytes')) or '-'
+        temp = item.get('temperature')
+        temp_str = f"{temp}°C" if isinstance(temp, int) else "-"
         print(
-            f"{item.get('controller','-'):<12} {str(item.get('health') or '-')[:6]:<7} {str(item.get('protocol') or '-')[:5]:<6} "
-            f"{str(item.get('transport') or '-')[:13]:<14} {size:>10}  "
-            f"{str(item.get('model') or '-')[:35]:<36} {str(item.get('firmware') or '-'):<12} {item.get('serial') or '-'}"
+            f"{str(item.get('controller') or '-'):<10} {str(item.get('health') or '-')[:5]:<6} {temp_str:>5} "
+            f"{str(item.get('protocol') or '-')[:5]:<6} {str(item.get('transport') or '-')[:11]:<12} "
+            f"{size:>9} {tbw:>10}  "
+            f"{str(item.get('model') or '-')[:24]:<25} {str(item.get('firmware') or '-'):<12} {item.get('serial') or '-'}"
         )
+    return EXIT_OK
+
+
+def _install_target_dir(args: argparse.Namespace) -> Path:
+    destdir = args.destdir if args.destdir is not None else os.environ.get("DESTDIR") or ""
+    prefix = args.prefix if args.prefix is not None else os.environ.get("PREFIX") or "/usr/local"
+    return Path(destdir + prefix) / "bin"
+
+
+def command_install(args: argparse.Namespace) -> int:
+    """Install the running standalone executable into $PREFIX/bin (default /usr/local/bin).
+
+    Only the standalone bundle installs itself; pip-installed copies are managed
+    by pip, and source runs have no single-file artifact to install.
+    """
+    if not str(__file__).startswith("<bundled:"):
+        print(
+            "ERROR: only the standalone nvme-doctor executable can install itself. "
+            "Run ./build.sh and then ./nvme-doctor install.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    source = os.path.realpath(sys.argv[0])
+    if not os.path.isfile(source) or not os.access(source, os.X_OK):
+        print(f"ERROR: cannot resolve the running executable: {sys.argv[0]}", file=sys.stderr)
+        return EXIT_ERROR
+
+    target = _install_target_dir(args) / "nvme-doctor"
+    if os.path.realpath(source) == os.path.realpath(str(target)):
+        print(f"nvme-doctor {__version__} is already installed at {target}")
+        return EXIT_OK
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        os.chmod(target, 0o755)
+    except OSError as exc:
+        print(f"ERROR: cannot install to {target}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"Installed nvme-doctor {__version__} to {target}")
+    return EXIT_OK
+
+
+def command_remove(args: argparse.Namespace) -> int:
+    """Remove the installed nvme-doctor from $PREFIX/bin (default /usr/local/bin)."""
+    target = _install_target_dir(args) / "nvme-doctor"
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"ERROR: cannot remove {target}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"Removed nvme-doctor from {target}")
     return EXIT_OK
 
 
@@ -655,6 +832,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return command_diff(args)
         if args.command == "watch":
             return command_watch(args)
+        if args.command == "install":
+            return command_install(args)
+        if args.command == "remove":
+            return command_remove(args)
         parser.error("unknown command")
         return EXIT_ERROR
     except ValueError as exc:
